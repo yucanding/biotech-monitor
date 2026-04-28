@@ -39,7 +39,7 @@ def send_telegram(message):
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
         "parse_mode": "HTML",
-        "disable_web_page_preview": True # 汇总信息建议禁用预览，避免太乱
+        "disable_web_page_preview": True 
     }
     try:
         requests.post(url, json=payload, timeout=15)
@@ -73,6 +73,20 @@ def analyze_event_time(title, body):
     except:
         return None
 
+def translate_title(title):
+    """使用 AI 将新闻标题翻译为中文"""
+    prompt = f"请将以下医药财经新闻标题翻译成简洁、专业的中文。直接返回翻译结果，不要有任何解释：{title}"
+    try:
+        response = client.chat.completions.create(
+            model="meta/llama-3.1-70b-instruct",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1, max_tokens=200
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"翻译失败: {e}")
+        return title # 失败则返回原标题
+
 def clean_title(title):
     """过滤掉标题末尾的股票代码后缀"""
     return re.sub(r'\s*\|\s*[A-Z]+\s+Stock News', '', title)
@@ -81,11 +95,10 @@ def run_monitor():
     current_utc_ts = time.time()
     cutoff_ts = current_utc_ts - (HOURS_WINDOW * 3600)
     
-    # 加载已发送数据库
     if not os.path.exists(SENT_DB_FILE): open(SENT_DB_FILE, "w").close()
     with open(SENT_DB_FILE, "r") as f: sent_urls = set(line.strip() for line in f)
 
-    collected_items = [] # 用于暂存所有新发现的新闻
+    collected_items = [] 
     new_urls = []
 
     for rss_url in RSS_URLS:
@@ -104,50 +117,48 @@ def run_monitor():
                re.search(PATTERN_SUBJECT, title_lower) and \
                not re.search(PATTERN_EXCLUDE, title_lower):
                 
-                # 提取代码
                 ticker_match = re.search(r'\|\s*([A-Z]+)\s+Stock News', title)
                 ticker = ticker_match.group(1) if ticker_match else "N/A"
                 
-                # 过滤标题
-                display_title = clean_title(title)
+                # 1. 清理标题
+                english_title = clean_title(title)
+                
+                # 2. 翻译标题 (核心修改)
+                chinese_title = translate_title(english_title)
                 
                 # 时间转换 (ET)
                 dt_et = datetime.fromtimestamp(pub_ts, tz=ZoneInfo("UTC")).astimezone(ZoneInfo("America/New_York"))
                 pub_date_et = dt_et.strftime('%Y-%m-%d %H:%M:%S %Z')
 
-                # AI 分析
+                # AI 分析时间
                 body_text = get_article_body(entry.link)
                 event_time = analyze_event_time(title, body_text) if body_text else None
 
-                # 存入列表
                 collected_items.append({
                     "ticker": ticker,
                     "pub_date": pub_date_et,
                     "event_time": event_time,
-                    "title": display_title,
+                    "title": chinese_title, # 使用中文标题
                     "link": entry.link
                 })
                 new_urls.append(entry.link)
 
-    # --- 批量构造并发送 ---
     if collected_items:
-        # 获取当前美东日期用于 Header
         now_et = datetime.now(ZoneInfo("America/New_York"))
-        header = f"🚨 <b>{now_et.month}月{now_et.day}日医药股数据发布预警（共{len(collected_items)}条）</b>\n\n"
+        header = f"🚨<b>{now_et.month}月{now_et.day}日医药股数据发布预警（共{len(collected_items)}条）</b>\n\n"
         
         full_msg = header
         for i, item in enumerate(collected_items, 1):
-            item_str = f"{i}. 🚀 股票代码: ${item['ticker']}\n"
-            item_str += f"   📅新闻发布: {item['pub_date']}\n"
+            item_str = f"{i}. 🚀股票代码: ${item['ticker']}\n"
+            item_str += f"   📅新闻时间: {item['pub_date']}\n"
             if item['event_time']:
                 item_str += f"   ⏰公布时间: {item['event_time']}\n"
             item_str += f"   📰内容标题: {item['title']}\n"
-            item_str += f"   🔗 <a href='{item['link']}'>点击查看公告</a>\n"
-            # 只有不是最后一条时才加分隔线
+            item_str += f"   🔗<a href='{item['link']}'>点击查看公告</a>\n"
+            
             if i < len(collected_items):
                 item_str += "--------------------------------\n"
             
-            # Telegram 限制一条消息约 4096 字符，若单条太长则分批发送
             if len(full_msg) + len(item_str) > 3800:
                 send_telegram(full_msg)
                 full_msg = "接上条续：\n\n" + item_str
@@ -156,7 +167,6 @@ def run_monitor():
         
         send_telegram(full_msg)
 
-        # 更新已发送列表
         with open(SENT_DB_FILE, "a") as f:
             for url in new_urls: f.write(url + "\n")
         print(f"成功推送 {len(collected_items)} 条新闻至频道。")
