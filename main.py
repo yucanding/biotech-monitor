@@ -146,6 +146,7 @@ def run_monitor():
     if collected_items:
         now_et = datetime.now(ZoneInfo("America/New_York"))
         header = f"🚨<b>{now_et.month}月{now_et.day}日医药股数据发布预警（共{len(collected_items)}条）</b>\n\n"
+        footer = "\n\n#ClinicalData"
         
         full_msg = header
         for i, item in enumerate(collected_items, 1):
@@ -159,13 +160,15 @@ def run_monitor():
             if i < len(collected_items):
                 item_str += "--------------------------------\n"
             
-            if len(full_msg) + len(item_str) > 3800:
-                send_telegram(full_msg)
+            if len(full_msg) + len(item_str) + len(footer) > 3900:
+                # 达到长度限制，先给当前部分加上标签并发送
+                send_telegram(full_msg + footer)
+                # 开始新的一条消息
                 full_msg = "接上条续：\n\n" + item_str
             else:
                 full_msg += item_str
         
-        send_telegram(full_msg)
+        send_telegram(full_msg + footer)
 
         with open(SENT_DB_FILE, "a") as f:
             for url in new_urls: f.write(url + "\n")
