@@ -91,7 +91,8 @@ def run_monitor():
     for rss_url in RSS_URLS:
         feed = feedparser.parse(rss_url)
         for entry in feed.entries:
-            if entry.link in sent_urls: continue
+            if entry.link in sent_urls or entry.link in new_urls:
+                continue
             
             pub_ts = calendar.timegm(entry.published_parsed) if hasattr(entry, 'published_parsed') else 0
             if pub_ts < cutoff_ts: continue
