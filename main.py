@@ -17,7 +17,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # --- 配置区 ---
-HOURS_WINDOW = 96
+HOURS_WINDOW = 48
 RSS_URLS = [
     "https://www.stocktitan.net/rss-clinical-trials",
     "https://www.stocktitan.net/rss-fda-approvals"
@@ -133,17 +133,19 @@ def run_monitor():
     if collected_items:
         # 获取当前美东日期用于 Header
         now_et = datetime.now(ZoneInfo("America/New_York"))
-        header = f"🚨 {now_et.month}月{now_et.day}日医药股数据发布预警（共{len(collected_items)}条）\n\n"
+        header = f"🚨 <b>{now_et.month}月{now_et.day}日医药股数据发布预警（共{len(collected_items)}条）</b>\n\n"
         
         full_msg = header
         for i, item in enumerate(collected_items, 1):
-            item_str = f"{i}. 🚀股票代码: {item['ticker']}\n"
+            item_str = f"{i}. 🚀 股票代码: ${item['ticker']}\n"
             item_str += f"   📅新闻发布: {item['pub_date']}\n"
             if item['event_time']:
                 item_str += f"   ⏰公布时间: {item['event_time']}\n"
             item_str += f"   📰内容标题: {item['title']}\n"
-            item_str += f"   🔗<a href='{item['link']}'>点击查看公告</a>\n"
-            item_str += "--------------------------------\n"
+            item_str += f"   🔗 <a href='{item['link']}'>点击查看公告</a>\n"
+            # 只有不是最后一条时才加分隔线
+            if i < len(collected_items):
+                item_str += "--------------------------------\n"
             
             # Telegram 限制一条消息约 4096 字符，若单条太长则分批发送
             if len(full_msg) + len(item_str) > 3800:
