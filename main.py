@@ -25,9 +25,9 @@ RSS_URLS = [
 SENT_DB_FILE = "sent_urls.txt"
 
 # 动作词/内容词：严格锁定
-PATTERN_ACTION = r"to (?:report|announce|discuss)"
+PATTERN_ACTION = r"to (?:report|announce|discuss|showcase )"
 PATTERN_SUBJECT = r"data|phase"
-PATTERN_EXCLUDE = r"financial|quarter|Q1"
+PATTERN_EXCLUDE = r"financial|quarter|Q1|Q2"
 
 scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True})
 client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=NVIDIA_API_KEY)
