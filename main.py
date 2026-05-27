@@ -146,7 +146,7 @@ def run_monitor():
     if collected_items:
         now_et = datetime.now(ZoneInfo("America/New_York"))
         header = f"🚨<b>{now_et.month}月{now_et.day}日医药股数据发布预警（共{len(collected_items)}条）</b>\n\n"
-        footer = "\n\n#ClinicalData"
+        footer = "\n#ClinicalData"
         
         full_msg = header
         for i, item in enumerate(collected_items, 1):
