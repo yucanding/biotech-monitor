@@ -1,11 +1,7 @@
 name: Biotech Daily Monitor
 
 on:
-  schedule:
-    # 每天 UTC 01:00 执行 (对应美东 21:00)
-    - cron: '0 1 * * *'
-    - cron: '0 10 * * *'
-  workflow_dispatch: # 允许手动点按钮执行
+  workflow_dispatch: # 允许外部接口（如 cron-job.org）或手动按钮执行
 
 jobs:
   run-task:
