@@ -32,30 +32,130 @@ PATTERN_ACTION = r"to (?:report|announce|discuss|showcase )"
 PATTERN_SUBJECT = r"data|phase|result|results|topline"
 PATTERN_EXCLUDE = r"financial|quarter|Q1|Q2|Q3|Q4"
 
-# Flash 够快、便宜，抽取/翻译足够；抽不准再换成 gemini-2.5-pro / gemini-3.8-flash
-GEMINI_MODEL = "gemini-3.6-flash"
+# 硬编码只作探测顺序；真正用哪个由 API list + hello 探测决定
+MODEL_PREFER = [
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.1-flash",
+    "gemini-flash-latest",
+    "gemini-2.0-flash",
+]
 
 scraper = cloudscraper.create_scraper(
     browser={"browser": "chrome", "platform": "windows", "desktop": True}
 )
 client = genai.Client(api_key=GEMINI_API_KEY)
+_ACTIVE_MODEL = None
 
 
-def gemini_text(prompt: str, max_tokens: int = 200) -> str:
-    """统一封装 Gemini 调用，失败返回空字符串。"""
+def _model_id(name: str) -> str:
+    return name.split("/")[-1] if name else ""
+
+
+def list_generate_models():
+    """向 API 拉取当前账号真正支持 generateContent 的模型。"""
+    ids = []
     try:
-        resp = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.1,
-                max_output_tokens=max_tokens,
-            ),
-        )
-        return (resp.text or "").strip()
+        for m in client.models.list():
+            actions = getattr(m, "supported_actions", None) or []
+            if "generateContent" in actions:
+                mid = _model_id(getattr(m, "name", "") or "")
+                if mid:
+                    ids.append(mid)
     except Exception as e:
-        print(f"Gemini 调用失败: {e}")
-        return ""
+        print(f"列出模型失败，改用本地候选: {e}")
+    return ids
+
+
+def pick_model():
+    """优先 flash；先按官方列表过滤，再用一句 hello 探测 404/503。"""
+    global _ACTIVE_MODEL
+    if _ACTIVE_MODEL:
+        return _ACTIVE_MODEL
+
+    listed = list_generate_models()
+    print("账号可见 generateContent 模型:", listed or "(空，用本地候选)")
+
+    flash_listed = [
+        m for m in listed if "flash" in m.lower() and "embed" not in m.lower()
+    ]
+    flash_listed.sort(reverse=True)
+
+    candidates = []
+    for m in MODEL_PREFER + flash_listed:
+        if m not in candidates:
+            candidates.append(m)
+
+    for mid in candidates:
+        try:
+            resp = client.models.generate_content(
+                model=mid,
+                contents="ok",
+                config=types.GenerateContentConfig(
+                    temperature=0,
+                    max_output_tokens=8,
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                        disable=True
+                    ),
+                ),
+            )
+            if getattr(resp, "text", None) is not None:
+                _ACTIVE_MODEL = mid
+                print(f"选用模型: {mid}")
+                return mid
+        except Exception as e:
+            msg = str(e)
+            if "404" in msg or "NOT_FOUND" in msg:
+                print(f"跳过不可用模型 {mid}")
+                continue
+            if "503" in msg or "UNAVAILABLE" in msg or "429" in msg:
+                print(f"{mid} 限流/高峰，换下一个")
+                continue
+            print(f"{mid} 探测失败: {e}")
+
+    raise RuntimeError("当前没有可用的 Gemini 文本模型，请稍后重跑")
+
+
+def gemini_text(prompt: str, max_tokens: int = 300) -> str:
+    """503/429/404 时清空已选模型并换下一个重试。"""
+    global _ACTIVE_MODEL
+    last_err = None
+    for attempt in range(4):
+        mid = pick_model()
+        try:
+            resp = client.models.generate_content(
+                model=mid,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    max_output_tokens=max_tokens,
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                        disable=True
+                    ),
+                ),
+            )
+            text = (resp.text or "").strip()
+            if text:
+                return text
+            last_err = "empty text"
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            print(f"Gemini 调用失败({mid}): {e}")
+            if (
+                "404" in msg
+                or "NOT_FOUND" in msg
+                or "503" in msg
+                or "UNAVAILABLE" in msg
+                or "429" in msg
+            ):
+                _ACTIVE_MODEL = None
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            break
+    print(f"Gemini 最终失败: {last_err}")
+    return ""
 
 
 def send_telegram(message):
@@ -88,7 +188,6 @@ def get_article_body(url):
 
 
 def analyze_event_time(title, body):
-    """抽取即将公布临床数据的具体日期/时间。"""
     prompt = f"""你是医药新闻信息抽取器。
 从标题和正文中提取「临床数据 / 试验结果 / topline / readout」即将公布或计划公布的日期和时间。
 
@@ -109,16 +208,16 @@ Body: {body or ""}
 
 
 def translate_title(title):
-    """医药财经标题译成简洁专业中文。"""
-    prompt = f"""将下面这条英文医药/生物科技财经新闻标题译成简洁、专业的中文。
+    prompt = f"""将下面英文医药财经新闻标题完整译成简洁专业中文。
 要求：
-- 只返回中文译文，不要解释、不要引号、不要拼音。
+- 只返回完整中文译文，不要解释、不要引号、不要拼音。
+- 必须译完整句，禁止截断后半句。
 - 保留公司名、药名、试验代号、Phase 1/2/3、FDA、topline 等专业词的惯用译法或原文。
 - 不要把股票代码后缀译出来。
 
 标题：{title}
 """
-    res = gemini_text(prompt, max_tokens=200)
+    res = gemini_text(prompt, max_tokens=300)
     return res if res else title
 
 
@@ -188,7 +287,10 @@ def run_monitor():
 
     if collected_items:
         now_et = datetime.now(ZoneInfo("America/New_York"))
-        header = f"🚨<b>{now_et.month}月{now_et.day}日医药股数据发布预警（共{len(collected_items)}条）</b>\n\n"
+        header = (
+            f"🚨<b>{now_et.month}月{now_et.day}日医药股数据发布预警"
+            f"（共{len(collected_items)}条）</b>\n\n"
+        )
         footer = "\n#ClinicalData"
 
         full_msg = header
