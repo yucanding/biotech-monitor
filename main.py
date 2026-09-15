@@ -16,6 +16,13 @@ from google.genai import types
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_USER_ID = os.getenv("TELEGRAM_USER_ID")
+
+TELEGRAM_TARGETS = [
+    x.strip()
+    for x in (TELEGRAM_CHAT_ID, TELEGRAM_USER_ID)
+    if x and x.strip()
+]
 
 if not GEMINI_API_KEY:
     raise RuntimeError("请先设置环境变量 GEMINI_API_KEY")
@@ -160,16 +167,22 @@ def gemini_text(prompt: str, max_tokens: int = 300) -> str:
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    try:
-        requests.post(url, json=payload, timeout=15)
-    except Exception as e:
-        print(f"发送失败: {e}")
+    if not TELEGRAM_TARGETS:
+        print("未配置任何 Telegram 目标")
+        return
+    for chat_id in TELEGRAM_TARGETS:
+        payload = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        try:
+            r = requests.post(url, json=payload, timeout=15)
+            if r.status_code != 200:
+                print(f"发送到 {chat_id} 失败: {r.text}")
+        except Exception as e:
+            print(f"发送到 {chat_id} 失败: {e}")
 
 
 def get_article_body(url):
@@ -192,11 +205,12 @@ def analyze_event_time(title, body):
 从标题和正文中提取「临床数据 / 试验结果 / topline / readout」即将公布或计划公布的日期和时间。
 
 规则：
-1. 只提取未来或即将发生的数据公布时间，不要提取新闻发布日期本身。
-2. 有明确日期就输出，例如：2026-10-15 或 October 15, 2026 before market 或 Q4 2026。
-3. 若只有季度/会议名（如 ASCO 2026、Q4 2026），原样输出该时间窗口。
-4. 完全没有公布时间则只回复 NONE，不要解释。
-5. 不要翻译，不要加引号，不要加任何前后缀。
+1. 只提取未来或即将发生的数据公布/电话会时间，不要提取新闻发布日期本身。
+2. 输出必须用中文，例如：2026年9月15日 上午8:30；或 2026年四季度；或 2026年ASCO年会。
+3. 有钟点就写上午/下午+点分，并注明时区，如ET/PT。
+4. 只有季度或会议名时，用中文写时间窗口。
+5. 完全没有公布时间则只回复 NONE，不要解释。
+6. 只返回这一行时间，不要引号，不要前后缀。
 
 Title: {title}
 Body: {body or ""}
@@ -267,7 +281,7 @@ def run_monitor():
                 dt_et = datetime.fromtimestamp(pub_ts, tz=ZoneInfo("UTC")).astimezone(
                     ZoneInfo("America/New_York")
                 )
-                pub_date_et = dt_et.strftime("%Y-%m-%d %H:%M:%S %Z")
+                pub_date_et = f"{dt_et.year}年{dt_et.month}月{dt_et.day}日 {dt_et.strftime('%H:%M')} ET"
 
                 body_text = get_article_body(entry.link)
                 event_time = (
@@ -314,7 +328,7 @@ def run_monitor():
         with open(SENT_DB_FILE, "a") as f:
             for url in new_urls:
                 f.write(url + "\n")
-        print(f"成功推送 {len(collected_items)} 条新闻至频道。")
+        print(f"成功推送 {len(collected_items)} 条新闻至 {len(TELEGRAM_TARGETS)} 个目标。")
     else:
         print("未发现满足条件的新条目。")
 
