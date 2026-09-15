@@ -33,7 +33,7 @@ PATTERN_SUBJECT = r"data|phase|result|results|topline"
 PATTERN_EXCLUDE = r"financial|quarter|Q1|Q2|Q3|Q4"
 
 # Flash 够快、便宜，抽取/翻译足够；抽不准再换成 gemini-2.5-pro / gemini-3.8-flash
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.6-flash"
 
 scraper = cloudscraper.create_scraper(
     browser={"browser": "chrome", "platform": "windows", "desktop": True}
