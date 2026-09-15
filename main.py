@@ -39,14 +39,17 @@ PATTERN_ACTION = r"to (?:report|announce|discuss|showcase )"
 PATTERN_SUBJECT = r"data|phase|result|results|topline"
 PATTERN_EXCLUDE = r"financial|quarter|Q1|Q2|Q3|Q4"
 
-# 硬编码只作探测顺序；真正用哪个由 API list + hello 探测决定
+# 优先更空闲的 lite / latest，把容易 503 的 3.8 放后面
 MODEL_PREFER = [
-    "gemini-3.8-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash",
-    "gemini-3.1-flash",
+    "gemini-flash-lite-latest",
     "gemini-flash-latest",
-    "gemini-2.0-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash",
+    "gemini-3.6-flash",
+    "gemini-3.8-flash",
 ]
 
 scraper = cloudscraper.create_scraper(
@@ -54,6 +57,7 @@ scraper = cloudscraper.create_scraper(
 )
 client = genai.Client(api_key=GEMINI_API_KEY)
 _ACTIVE_MODEL = None
+_SKIP_MODELS = set()
 
 
 def _model_id(name: str) -> str:
@@ -61,7 +65,6 @@ def _model_id(name: str) -> str:
 
 
 def list_generate_models():
-    """向 API 拉取当前账号真正支持 generateContent 的模型。"""
     ids = []
     try:
         for m in client.models.list():
@@ -76,22 +79,27 @@ def list_generate_models():
 
 
 def pick_model():
-    """优先 flash；先按官方列表过滤，再用一句 hello 探测 404/503。"""
     global _ACTIVE_MODEL
-    if _ACTIVE_MODEL:
+    if _ACTIVE_MODEL and _ACTIVE_MODEL not in _SKIP_MODELS:
         return _ACTIVE_MODEL
 
     listed = list_generate_models()
     print("账号可见 generateContent 模型:", listed or "(空，用本地候选)")
 
     flash_listed = [
-        m for m in listed if "flash" in m.lower() and "embed" not in m.lower()
+        m
+        for m in listed
+        if "flash" in m.lower()
+        and "embed" not in m.lower()
+        and "image" not in m.lower()
+        and "tts" not in m.lower()
+        and "omni" not in m.lower()
+        and "transcribe" not in m.lower()
     ]
-    flash_listed.sort(reverse=True)
 
     candidates = []
     for m in MODEL_PREFER + flash_listed:
-        if m not in candidates:
+        if m not in candidates and m not in _SKIP_MODELS:
             candidates.append(m)
 
     for mid in candidates:
@@ -115,21 +123,27 @@ def pick_model():
             msg = str(e)
             if "404" in msg or "NOT_FOUND" in msg:
                 print(f"跳过不可用模型 {mid}")
+                _SKIP_MODELS.add(mid)
                 continue
             if "503" in msg or "UNAVAILABLE" in msg or "429" in msg:
                 print(f"{mid} 限流/高峰，换下一个")
+                _SKIP_MODELS.add(mid)
                 continue
             print(f"{mid} 探测失败: {e}")
+            _SKIP_MODELS.add(mid)
 
     raise RuntimeError("当前没有可用的 Gemini 文本模型，请稍后重跑")
 
 
 def gemini_text(prompt: str, max_tokens: int = 300) -> str:
-    """503/429/404 时清空已选模型并换下一个重试。"""
     global _ACTIVE_MODEL
     last_err = None
-    for attempt in range(4):
-        mid = pick_model()
+    for attempt in range(6):
+        try:
+            mid = pick_model()
+        except RuntimeError as e:
+            last_err = e
+            break
         try:
             resp = client.models.generate_content(
                 model=mid,
@@ -157,8 +171,9 @@ def gemini_text(prompt: str, max_tokens: int = 300) -> str:
                 or "UNAVAILABLE" in msg
                 or "429" in msg
             ):
+                _SKIP_MODELS.add(mid)
                 _ACTIVE_MODEL = None
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(1.2 * (attempt + 1))
                 continue
             break
     print(f"Gemini 最终失败: {last_err}")
@@ -202,7 +217,7 @@ def get_article_body(url):
 
 def analyze_event_time(title, body):
     prompt = f"""你是医药新闻信息抽取器。
-从标题和正文中提取「临床数据 / 试验结果 / topline / readout」即将公布或计划公布的日期和时间。
+从标题和正文中提取「临床数据 / 试验结果 / topline / readout」即将公布或计划召开电话会的日期和时间。
 
 规则：
 1. 只提取未来或即将发生的数据公布/电话会时间，不要提取新闻发布日期本身。
@@ -221,6 +236,19 @@ Body: {body or ""}
     return res
 
 
+def _looks_truncated_zh(text: str, source_en: str) -> bool:
+    if not text:
+        return True
+    t = text.strip()
+    if t.endswith(("讨论", "宣布", "报告", "召开", "关于", "以及", "与", "的")):
+        return True
+    if t.endswith((",", "，", ":", "：", "...", "…")):
+        return True
+    if len(t) < max(8, int(len(source_en) * 0.25)):
+        return True
+    return False
+
+
 def translate_title(title):
     prompt = f"""将下面英文医药财经新闻标题完整译成简洁专业中文。
 要求：
@@ -232,11 +260,18 @@ def translate_title(title):
 标题：{title}
 """
     res = gemini_text(prompt, max_tokens=300)
-    return res if res else title
+    if not res or _looks_truncated_zh(res, title):
+        print(f"译文不可用，回退英文标题: {title}")
+        return title
+    return res
 
 
 def clean_title(title):
     return re.sub(r"\s*\|\s*[A-Z]+\s+Stock News", "", title)
+
+
+def format_et_cn(dt):
+    return f"{dt.year}年{dt.month}月{dt.day}日 {dt.strftime('%H:%M')} 美东时间"
 
 
 def run_monitor():
@@ -281,7 +316,7 @@ def run_monitor():
                 dt_et = datetime.fromtimestamp(pub_ts, tz=ZoneInfo("UTC")).astimezone(
                     ZoneInfo("America/New_York")
                 )
-                pub_date_et = f"{dt_et.year}年{dt_et.month}月{dt_et.day}日 {dt_et.strftime('%H:%M')} ET"
+                pub_date_et = format_et_cn(dt_et)
 
                 body_text = get_article_body(entry.link)
                 event_time = (
@@ -328,7 +363,9 @@ def run_monitor():
         with open(SENT_DB_FILE, "a") as f:
             for url in new_urls:
                 f.write(url + "\n")
-        print(f"成功推送 {len(collected_items)} 条新闻至 {len(TELEGRAM_TARGETS)} 个目标。")
+        print(
+            f"成功推送 {len(collected_items)} 条新闻至 {len(TELEGRAM_TARGETS)} 个目标。"
+        )
     else:
         print("未发现满足条件的新条目。")
 
