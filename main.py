@@ -271,7 +271,7 @@ def clean_title(title):
 
 
 def format_et_cn(dt):
-    return f"{dt.year}年{dt.month}月{dt.day}日 {dt.strftime('%H:%M')} 美东时间"
+    return f"{dt.year}年{dt.month}月{dt.day}日 {dt.strftime('%H:%M')} ET"
 
 
 def run_monitor():
