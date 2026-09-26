@@ -35,9 +35,9 @@ RSS_URLS = [
 ]
 SENT_DB_FILE = "sent_urls.txt"
 
-PATTERN_ACTION = r"to (?:report|announce|discuss|showcase )"
+PATTERN_ACTION = r"to (?:report|announce|discuss|showcase|present )"
 PATTERN_SUBJECT = r"data|phase|result|results|topline"
-PATTERN_EXCLUDE = r"financial|quarter|Q1|Q2|Q3|Q4"
+PATTERN_EXCLUDE = r"financial|quarter|Q1|Q2|Q3|Q4|annual|meeting|congress|conference|symposium"
 
 # 优先更空闲的 lite / latest，把容易 503 的 3.8 放后面
 MODEL_PREFER = [
