@@ -25,11 +25,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_USER_ID = os.getenv("TELEGRAM_USER_ID")
-TELEGRAM_TARGETS = [
-    x.strip()
-    for x in (TELEGRAM_CHAT_ID, TELEGRAM_USER_ID)
-    if x and x.strip()
-]
+TELEGRAM_TARGETS = [x.strip() for x in (TELEGRAM_CHAT_ID, TELEGRAM_USER_ID) if x and x.strip()]
 if not GEMINI_API_KEY:
     raise RuntimeError("请先设置环境变量 GEMINI_API_KEY")
 
@@ -62,14 +58,12 @@ MODEL_PREFER = [
     "gemini-3.8-flash",
 ]
 
-scraper = cloudscraper.create_scraper(
-    browser={"browser": "chrome", "platform": "windows", "desktop": True}
-)
+scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "desktop": True})
 client = genai.Client(api_key=GEMINI_API_KEY)
 _ACTIVE_MODEL = None
 _SKIP_MODELS = set()
 
-# ==================== Gemini（仅用于 StockTitan） ====================
+# ==================== Gemini ====================
 def _model_id(name: str) -> str:
     return name.split("/")[-1] if name else ""
 
@@ -90,8 +84,10 @@ def pick_model():
     global _ACTIVE_MODEL
     if _ACTIVE_MODEL and _ACTIVE_MODEL not in _SKIP_MODELS:
         return _ACTIVE_MODEL
+
     listed = list_generate_models()
     print("账号可见 generateContent 模型:", listed or "(空，用本地候选)", flush=True)
+
     flash_listed = [
         m for m in listed
         if "flash" in m.lower()
@@ -101,10 +97,12 @@ def pick_model():
         and "omni" not in m.lower()
         and "transcribe" not in m.lower()
     ]
+
     candidates = []
     for m in MODEL_PREFER + flash_listed:
         if m not in candidates and m not in _SKIP_MODELS:
             candidates.append(m)
+
     for mid in candidates:
         try:
             resp = client.models.generate_content(
@@ -126,17 +124,20 @@ def pick_model():
                 _SKIP_MODELS.add(mid)
                 continue
             _SKIP_MODELS.add(mid)
+
     raise RuntimeError("当前没有可用的 Gemini 文本模型，请稍后重跑")
 
 def gemini_text(prompt: str, max_tokens: int = 300) -> str:
     global _ACTIVE_MODEL
     last_err = None
+
     for attempt in range(6):
         try:
             mid = pick_model()
         except RuntimeError as e:
             last_err = e
             break
+
         try:
             resp = client.models.generate_content(
                 model=mid,
@@ -161,14 +162,17 @@ def gemini_text(prompt: str, max_tokens: int = 300) -> str:
                 time.sleep(1.2 * (attempt + 1))
                 continue
             break
+
     print(f"Gemini 最终失败: {last_err}", flush=True)
     return ""
 
+# ==================== Telegram ====================
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     if not TELEGRAM_TARGETS:
         print("未配置任何 Telegram 目标", flush=True)
         return
+
     for chat_id in TELEGRAM_TARGETS:
         payload = {
             "chat_id": chat_id,
@@ -183,6 +187,7 @@ def send_telegram(message):
         except Exception as e:
             print(f"发送到 {chat_id} 失败: {e}", flush=True)
 
+# ==================== StockTitan ====================
 def get_article_body(url):
     try:
         time.sleep(random.uniform(2, 4))
@@ -206,10 +211,10 @@ def analyze_event_time(title, body):
 3. 有钟点就写上午/下午+点分，并注明时区，如ET/PT。
 4. 只有季度或会议名时，用中文写时间窗口。
 5. 完全没有公布时间则只回复 NONE，不要解释。
-6. 只返回这一行时间，不要引号，不要前后缀。
+6. 只返回这一行时间，不要引号、不要前后缀。
 Title: {title}
-Body: {body or ""}
-"""
+Body: {body or ""}"""
+
     res = gemini_text(prompt, max_tokens=80)
     if not res or "NONE" in res.upper():
         return None
@@ -228,15 +233,14 @@ def _looks_truncated_zh(text: str, source_en: str) -> bool:
     return False
 
 def translate_title(title):
-    """仅用于 StockTitan 标题（Gemini）"""
     prompt = f"""将下面英文医药财经新闻标题完整译成简洁专业中文。
 要求：
 - 只返回完整中文译文，不要解释、不要引号、不要拼音。
 - 必须译完整句，禁止截断后半句。
 - 保留公司名、药名、试验代号、Phase 1/2/3、FDA、topline 等专业词的惯用译法或原文。
 - 不要把股票代码后缀译出来。
-标题：{title}
-"""
+标题：{title}"""
+
     res = gemini_text(prompt, max_tokens=300)
     if not res or _looks_truncated_zh(res, title):
         print(f"译文不可用，回退英文标题: {title}", flush=True)
@@ -256,16 +260,17 @@ def kill_browser_processes():
     except Exception:
         pass
 
-# ==================== BPIQ 翻译（非 AI：translators 多引擎） ====================
+# ==================== BPIQ 翻译 ====================
 def translate_bpiq_text(text: str) -> str:
-    """仅用于 BPIQ，不使用任何 AI / Gemini"""
     if not text or not text.strip():
         return text
+
     if ts is None:
         print("[BPIQ] 未安装 translators，返回英文原文", flush=True)
         return text
 
     engines = ["bing", "alibaba", "baidu", "sogou", "tencent"]
+
     for engine in engines:
         try:
             result = ts.translate_text(
@@ -278,29 +283,47 @@ def translate_bpiq_text(text: str) -> str:
                 return result.strip()
         except Exception:
             continue
+
     print(f"[BPIQ] 翻译失败，返回原文: {text[:60]}...", flush=True)
     return text
+
+def clean_stage_event(text: str) -> str:
+    """删除 Stage & Event 中的 data readout / Approval decision，忽略大小写。"""
+    if not text:
+        return text
+
+    text = re.sub(r"\bdata\s+readout\b", "", text, flags=re.I)
+    text = re.sub(r"\bapproval\s+decision\b", "", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # 删除关键词移除后残留在开头/结尾的标点
+    text = re.sub(r"^\s*[-–—,:;/|&]+\s*", "", text)
+    text = re.sub(r"\s*[-–—,:;/|&]+\s*$", "", text)
+
+    return text.strip()
 
 # ==================== BPIQ 日期解析 ====================
 def _month_to_num(name: str) -> Optional[int]:
     mapping = {
         "jan": 1, "january": 1, "feb": 2, "february": 2,
         "mar": 3, "march": 3, "apr": 4, "april": 4, "may": 5,
-        "jun": 6, "june": 6, "jul": 7, "july": 7,
-        "aug": 8, "august": 8, "sep": 9, "september": 9,
-        "oct": 10, "october": 10, "nov": 11, "november": 11,
-        "dec": 12, "december": 12,
+        "jun": 6, "june": 6, "jul": 7, "july": 7, "aug": 8,
+        "august": 8, "sep": 9, "september": 9, "oct": 10,
+        "october": 10, "nov": 11, "november": 11, "dec": 12,
+        "december": 12,
     }
     return mapping.get(name.lower())
 
 def parse_catalyst_date(date_str: str) -> Optional[Tuple[str, date]]:
     if not date_str or not date_str.strip():
         return None
+
     original = date_str.strip()
 
     m = re.search(
         r"(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),?\s+(\d{4})",
-        original, re.I,
+        original,
+        re.I,
     )
     if m and not re.search(r"\d{1,2}\s*-\s*\d{1,2}", original):
         month_name, day, year = m.groups()
@@ -313,7 +336,8 @@ def parse_catalyst_date(date_str: str) -> Optional[Tuple[str, date]]:
 
     m = re.search(
         r"(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s*-\s*(\d{1,2}),?\s+(\d{4})",
-        original, re.I,
+        original,
+        re.I,
     )
     if m:
         month_name, _, day2, year = m.groups()
@@ -326,7 +350,8 @@ def parse_catalyst_date(date_str: str) -> Optional[Tuple[str, date]]:
 
     m = re.search(
         r"(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})",
-        original, re.I,
+        original,
+        re.I,
     )
     if m:
         month_name, year = m.groups()
@@ -361,8 +386,10 @@ def parse_catalyst_date(date_str: str) -> Optional[Tuple[str, date]]:
     m = re.search(r"\b(20\d{2})\b", original)
     if m:
         return original, date(int(m.group(1)), 12, 31)
+
     return None
 
+# ==================== BPIQ 抓取 ====================
 async def scrape_bpiq_catalysts(exclude_tickers: set) -> List[Dict]:
     try:
         from playwright.async_api import async_playwright
@@ -378,23 +405,31 @@ async def scrape_bpiq_catalysts(exclude_tickers: set) -> List[Dict]:
 
     if not os.path.exists(BPIQ_SENT_DB_FILE):
         open(BPIQ_SENT_DB_FILE, "w").close()
+
     with open(BPIQ_SENT_DB_FILE, "r") as f:
         bpiq_sent = set(line.strip() for line in f)
 
     browser = None
+
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
-                args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
             )
+
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 720},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
             )
-            page = await context.new_page()
 
+            page = await context.new_page()
             print("[BPIQ] 打开页面...", flush=True)
+
             try:
                 await page.goto(
                     "https://app.bpiq.com/catalyst-calendar",
@@ -413,11 +448,13 @@ async def scrape_bpiq_catalysts(exclude_tickers: set) -> List[Dict]:
                 return []
 
             await asyncio.sleep(3)
+
             rows = await page.query_selector_all("table tbody tr") or await page.query_selector_all("tr")
             print(f"[BPIQ] 找到 {len(rows)} 行", flush=True)
 
-            # 第一遍：只过滤，不翻译
+            # 第一遍：过滤
             candidates = []
+
             for row in rows:
                 try:
                     cells = await row.query_selector_all("td")
@@ -426,11 +463,13 @@ async def scrape_bpiq_catalysts(exclude_tickers: set) -> List[Dict]:
 
                     company_text = (await cells[0].inner_text()).strip()
                     ticker = company_text.split()[0] if company_text else ""
+
                     if not ticker or ticker in exclude_tickers:
                         continue
 
                     company_link = ""
                     a_tag = await cells[0].query_selector("a")
+
                     if a_tag:
                         href = await a_tag.get_attribute("href")
                         if href:
@@ -441,37 +480,49 @@ async def scrape_bpiq_catalysts(exclude_tickers: set) -> List[Dict]:
 
                     date_cell = cells[4]
                     full_text = (await date_cell.inner_text()).strip()
+
                     date_match = re.search(
                         r"((?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}(?:\s*-\s*\d{1,2})?,?\s+\d{4}|"
                         r"(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}|"
                         r"Q[1-4]\s*'?\d{2,4}|"
                         r"(?:Summer|Mid|Late|Early|H[12])\s+\d{4})",
-                        full_text, re.I,
+                        full_text,
+                        re.I,
                     )
+
                     if not date_match:
                         continue
 
                     date_raw = date_match.group(1)
                     parsed = parse_catalyst_date(date_raw)
+
                     if not parsed:
                         continue
+
                     original_str, compare_date = parsed
 
                     if not (start_date <= compare_date <= end_date):
                         continue
 
                     dedup_key = f"{ticker}|{original_str}"
+
                     if dedup_key in bpiq_sent:
                         continue
 
                     source_link = company_link
                     links = await date_cell.query_selector_all("a")
+
                     for link in links:
                         href = await link.get_attribute("href")
                         text = ((await link.inner_text()) or "").lower()
-                        if href and ("view source" in text or any(x in href for x in ["globenewswire", "prnewswire", "sec.gov", "businesswire"])):
+
+                        if href and (
+                            "view source" in text
+                            or any(x in href for x in ["globenewswire", "prnewswire", "sec.gov", "businesswire"])
+                        ):
                             source_link = href
                             break
+
                         if href and href.startswith("http") and not source_link:
                             source_link = href
 
@@ -483,21 +534,23 @@ async def scrape_bpiq_catalysts(exclude_tickers: set) -> List[Dict]:
                         "link": source_link or company_link or "https://app.bpiq.com/catalyst-calendar",
                         "dedup_key": dedup_key,
                     })
+
                 except Exception:
                     continue
 
             print(f"[BPIQ] 日期过滤后剩余 {len(candidates)} 条，开始翻译（非AI）...", flush=True)
 
-            now_et = datetime.now(ZoneInfo("America/New_York"))
-            pub_date_str = format_et_cn(now_et)
-
+            # 第二遍：翻译并生成标题
             for c in candidates:
                 drug_zh = translate_bpiq_text(c["drug_en"])
-                stage_zh = translate_bpiq_text(c["stage_en"])
-                title = f"{drug_zh} {stage_zh}".strip()
+                stage_en = clean_stage_event(c["stage_en"])
+
+                # Drug & Indication 中文 + Stage & Event 英文
+                # 两者之间不加空格
+                title = f"{drug_zh}{stage_en}".strip()
+
                 items.append({
                     "ticker": c["ticker"],
-                    "pub_date": pub_date_str,
                     "event_time": c["date_raw"],
                     "title": title,
                     "link": c["link"],
@@ -505,9 +558,11 @@ async def scrape_bpiq_catalysts(exclude_tickers: set) -> List[Dict]:
                 })
 
             print(f"[BPIQ] 本轮最终 {len(items)} 条", flush=True)
+
     except Exception as e:
         print(f"[BPIQ] 异常: {e}", flush=True)
         return []
+
     finally:
         try:
             if browser:
@@ -518,26 +573,27 @@ async def scrape_bpiq_catalysts(exclude_tickers: set) -> List[Dict]:
 
     return items
 
+# ==================== 合并推送 ====================
 def push_combined(items: List[Dict], bpiq_keys: List[str]):
     if not items:
         print("无符合条件的事件", flush=True)
         return
 
     now_et = datetime.now(ZoneInfo("America/New_York"))
-    header = (
-        f"🚨<b>{now_et.month}月{now_et.day}日医药股数据发布预警"
-        f"（共{len(items)}条）</b>\n\n"
-    )
+    header = f"🚨<b>{now_et.month}月{now_et.day}日医药股数据发布预警（共{len(items)}条）</b>\n\n"
     footer = "\n#ClinicalData"
     full_msg = header
 
     for i, item in enumerate(items, 1):
         item_str = f"{i}. 🚀股票代码: ${item['ticker']}\n"
-        item_str += f"   📅新闻时间: {item['pub_date']}\n"
+
+        # 只保留公布时间，删除新闻时间
         if item.get("event_time"):
             item_str += f"   ⏰公布时间: {item['event_time']}\n"
+
         item_str += f"   📰内容标题: {item['title']}\n"
         item_str += f"   🔗<a href='{item['link']}'>点击查看公告</a>\n"
+
         if i < len(items):
             item_str += "--------------------------------\n"
 
@@ -563,6 +619,7 @@ def run_monitor():
 
     if not os.path.exists(SENT_DB_FILE):
         open(SENT_DB_FILE, "w").close()
+
     with open(SENT_DB_FILE, "r") as f:
         sent_urls = set(line.strip() for line in f)
 
@@ -570,21 +627,26 @@ def run_monitor():
     new_urls = []
     rss_tickers = set()
 
-    # ---- 1. StockTitan（Gemini 仅用于这里） ----
+    # ---- 1. StockTitan ----
     for rss_url in RSS_URLS:
         feed = feedparser.parse(rss_url)
+
         for entry in feed.entries:
             if entry.link in sent_urls or entry.link in new_urls:
                 continue
+
             pub_ts = (
                 calendar.timegm(entry.published_parsed)
                 if hasattr(entry, "published_parsed")
                 else 0
             )
+
             if pub_ts < cutoff_ts:
                 continue
+
             title = entry.title
             title_lower = title.lower()
+
             if (
                 re.search(PATTERN_ACTION, title_lower)
                 and re.search(PATTERN_SUBJECT, title_lower)
@@ -596,9 +658,14 @@ def run_monitor():
 
                 english_title = clean_title(title)
                 chinese_title = translate_title(english_title)
-                dt_et = datetime.fromtimestamp(pub_ts, tz=ZoneInfo("UTC")).astimezone(
+
+                dt_et = datetime.fromtimestamp(
+                    pub_ts,
+                    tz=ZoneInfo("UTC")
+                ).astimezone(
                     ZoneInfo("America/New_York")
                 )
+
                 pub_date_et = format_et_cn(dt_et)
                 body_text = get_article_body(entry.link)
                 event_time = analyze_event_time(english_title, body_text) if body_text else None
@@ -610,12 +677,15 @@ def run_monitor():
                     "title": chinese_title,
                     "link": entry.link,
                 })
+
                 new_urls.append(entry.link)
 
-    # ---- 2. BPIQ（不用任何 AI） ----
+    # ---- 2. BPIQ ----
     bpiq_keys = []
+
     if ENABLE_BPIQ:
         print("\n[BPIQ] 开始抓取...", flush=True)
+
         try:
             bpiq_items = asyncio.run(
                 asyncio.wait_for(
@@ -623,29 +693,37 @@ def run_monitor():
                     timeout=120,
                 )
             )
+
             for it in bpiq_items:
                 collected_items.append(it)
                 bpiq_keys.append(it["dedup_key"])
+
         except asyncio.TimeoutError:
             print("[BPIQ] 超时，跳过", flush=True)
+
         except Exception as e:
             print(f"[BPIQ] 失败: {e}", flush=True)
+
         finally:
             kill_browser_processes()
+
     else:
         print("[BPIQ] 已关闭", flush=True)
 
     # ---- 3. 合并推送 ----
     if collected_items:
         push_combined(collected_items, bpiq_keys)
+
         with open(SENT_DB_FILE, "a") as f:
             for url in new_urls:
                 f.write(url + "\n")
+
     else:
         print("未发现满足条件的新条目（RSS 与 BPIQ 均为空）", flush=True)
         print(f"RSS: new_urls={len(new_urls)}, tickers={rss_tickers}", flush=True)
         print(f"BPIQ keys: {len(bpiq_keys)}", flush=True)
 
+# ==================== 程序入口 ====================
 if __name__ == "__main__":
     try:
         run_monitor()
