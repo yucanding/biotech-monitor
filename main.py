@@ -6,40 +6,47 @@ import cloudscraper
 import random
 import os
 import requests
-from datetime import datetime
+import asyncio
+from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from bs4 import BeautifulSoup
 from google import genai
 from google.genai import types
+from typing import Optional, List, Dict, Tuple
+from urllib.parse import urlparse
 
-# --- 环境变量 ---
+# ==================== 环境变量 ====================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_USER_ID = os.getenv("TELEGRAM_USER_ID")
-
 TELEGRAM_TARGETS = [
     x.strip()
     for x in (TELEGRAM_CHAT_ID, TELEGRAM_USER_ID)
     if x and x.strip()
 ]
-
 if not GEMINI_API_KEY:
     raise RuntimeError("请先设置环境变量 GEMINI_API_KEY")
 
-# --- 配置 ---
+# ==================== 配置 ====================
 HOURS_WINDOW = 48
 RSS_URLS = [
     "https://www.stocktitan.net/rss-clinical-trials",
     "https://www.stocktitan.net/rss-fda-approvals",
 ]
 SENT_DB_FILE = "sent_urls.txt"
+BPIQ_SENT_DB_FILE = "sent_bpiq.txt"          # BPIQ 专用去重文件
+
+# ---------- BPIQ 开关与时间窗口 ----------
+ENABLE_BPIQ = True       # True=推送 BPIQ；False=只跑原来的 RSS
+DAYS_BEFORE = 0          # 往前几天（0=今天）
+DAYS_AFTER  = 1          # 往后几天（0=今天）
+# ----------------------------------------
 
 PATTERN_ACTION = r"to (?:report|announce|discuss|showcase|present )"
 PATTERN_SUBJECT = r"data|phase|result|results|topline"
 PATTERN_EXCLUDE = r"financial|quarter|Q1|Q2|Q3|Q4|annual|meeting|congress|conference|symposium"
 
-# 优先更空闲的 lite / latest，把容易 503 的 3.8 放后面
 MODEL_PREFER = [
     "gemini-flash-lite-latest",
     "gemini-flash-latest",
@@ -59,10 +66,9 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 _ACTIVE_MODEL = None
 _SKIP_MODELS = set()
 
-
+# ==================== 原有工具函数（保持不变） ====================
 def _model_id(name: str) -> str:
     return name.split("/")[-1] if name else ""
-
 
 def list_generate_models():
     ids = []
@@ -77,18 +83,14 @@ def list_generate_models():
         print(f"列出模型失败，改用本地候选: {e}")
     return ids
 
-
 def pick_model():
     global _ACTIVE_MODEL
     if _ACTIVE_MODEL and _ACTIVE_MODEL not in _SKIP_MODELS:
         return _ACTIVE_MODEL
-
     listed = list_generate_models()
     print("账号可见 generateContent 模型:", listed or "(空，用本地候选)")
-
     flash_listed = [
-        m
-        for m in listed
+        m for m in listed
         if "flash" in m.lower()
         and "embed" not in m.lower()
         and "image" not in m.lower()
@@ -96,12 +98,10 @@ def pick_model():
         and "omni" not in m.lower()
         and "transcribe" not in m.lower()
     ]
-
     candidates = []
     for m in MODEL_PREFER + flash_listed:
         if m not in candidates and m not in _SKIP_MODELS:
             candidates.append(m)
-
     for mid in candidates:
         try:
             resp = client.models.generate_content(
@@ -110,9 +110,7 @@ def pick_model():
                 config=types.GenerateContentConfig(
                     temperature=0,
                     max_output_tokens=8,
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                        disable=True
-                    ),
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                 ),
             )
             if getattr(resp, "text", None) is not None:
@@ -131,9 +129,7 @@ def pick_model():
                 continue
             print(f"{mid} 探测失败: {e}")
             _SKIP_MODELS.add(mid)
-
     raise RuntimeError("当前没有可用的 Gemini 文本模型，请稍后重跑")
-
 
 def gemini_text(prompt: str, max_tokens: int = 300) -> str:
     global _ACTIVE_MODEL
@@ -151,9 +147,7 @@ def gemini_text(prompt: str, max_tokens: int = 300) -> str:
                 config=types.GenerateContentConfig(
                     temperature=0.1,
                     max_output_tokens=max_tokens,
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                        disable=True
-                    ),
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                 ),
             )
             text = (resp.text or "").strip()
@@ -164,13 +158,7 @@ def gemini_text(prompt: str, max_tokens: int = 300) -> str:
             last_err = e
             msg = str(e)
             print(f"Gemini 调用失败({mid}): {e}")
-            if (
-                "404" in msg
-                or "NOT_FOUND" in msg
-                or "503" in msg
-                or "UNAVAILABLE" in msg
-                or "429" in msg
-            ):
+            if any(x in msg for x in ["404", "NOT_FOUND", "503", "UNAVAILABLE", "429"]):
                 _SKIP_MODELS.add(mid)
                 _ACTIVE_MODEL = None
                 time.sleep(1.2 * (attempt + 1))
@@ -178,7 +166,6 @@ def gemini_text(prompt: str, max_tokens: int = 300) -> str:
             break
     print(f"Gemini 最终失败: {last_err}")
     return ""
-
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -199,7 +186,6 @@ def send_telegram(message):
         except Exception as e:
             print(f"发送到 {chat_id} 失败: {e}")
 
-
 def get_article_body(url):
     try:
         time.sleep(random.uniform(2, 4))
@@ -214,11 +200,9 @@ def get_article_body(url):
         print(f"抓取正文失败: {e}")
         return None
 
-
 def analyze_event_time(title, body):
     prompt = f"""你是医药新闻信息抽取器。
 从标题和正文中提取「临床数据 / 试验结果 / topline / readout」即将公布或计划召开电话会的日期和时间。
-
 规则：
 1. 只提取未来或即将发生的数据公布/电话会时间，不要提取新闻发布日期本身。
 2. 输出必须用中文，例如：2026年9月15日 上午8:30；或 2026年四季度；或 2026年ASCO年会。
@@ -226,7 +210,6 @@ def analyze_event_time(title, body):
 4. 只有季度或会议名时，用中文写时间窗口。
 5. 完全没有公布时间则只回复 NONE，不要解释。
 6. 只返回这一行时间，不要引号，不要前后缀。
-
 Title: {title}
 Body: {body or ""}
 """
@@ -234,7 +217,6 @@ Body: {body or ""}
     if not res or "NONE" in res.upper():
         return None
     return res
-
 
 def _looks_truncated_zh(text: str, source_en: str) -> bool:
     if not text:
@@ -248,7 +230,6 @@ def _looks_truncated_zh(text: str, source_en: str) -> bool:
         return True
     return False
 
-
 def translate_title(title):
     prompt = f"""将下面英文医药财经新闻标题完整译成简洁专业中文。
 要求：
@@ -256,7 +237,6 @@ def translate_title(title):
 - 必须译完整句，禁止截断后半句。
 - 保留公司名、药名、试验代号、Phase 1/2/3、FDA、topline 等专业词的惯用译法或原文。
 - 不要把股票代码后缀译出来。
-
 标题：{title}
 """
     res = gemini_text(prompt, max_tokens=300)
@@ -265,15 +245,281 @@ def translate_title(title):
         return title
     return res
 
-
 def clean_title(title):
     return re.sub(r"\s*\|\s*[A-Z]+\s+Stock News", "", title)
-
 
 def format_et_cn(dt):
     return f"{dt.year}年{dt.month}月{dt.day}日 {dt.strftime('%H:%M')} ET"
 
+# ==================== BPIQ 相关函数 ====================
+def _month_to_num(name: str) -> Optional[int]:
+    mapping = {
+        'jan': 1, 'january': 1, 'feb': 2, 'february': 2,
+        'mar': 3, 'march': 3, 'apr': 4, 'april': 4, 'may': 5,
+        'jun': 6, 'june': 6, 'jul': 7, 'july': 7,
+        'aug': 8, 'august': 8, 'sep': 9, 'september': 9,
+        'oct': 10, 'october': 10, 'nov': 11, 'november': 11,
+        'dec': 12, 'december': 12,
+    }
+    return mapping.get(name.lower())
 
+def parse_catalyst_date(date_str: str) -> Optional[Tuple[str, date]]:
+    if not date_str or not date_str.strip():
+        return None
+    original = date_str.strip()
+
+    # 精确单一日期
+    m = re.search(
+        r'(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),?\s+(\d{4})',
+        original, re.I
+    )
+    if m and not re.search(r'\d{1,2}\s*-\s*\d{1,2}', original):
+        month_name, day, year = m.groups()
+        month = _month_to_num(month_name)
+        if month:
+            try:
+                return original, date(int(year), month, int(day))
+            except ValueError:
+                pass
+
+    # 日期区间 → 取最晚一天
+    m = re.search(
+        r'(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s*-\s*(\d{1,2}),?\s+(\d{4})',
+        original, re.I
+    )
+    if m:
+        month_name, _, day2, year = m.groups()
+        month = _month_to_num(month_name)
+        if month:
+            try:
+                return original, date(int(year), month, int(day2))
+            except ValueError:
+                pass
+
+    # 只有月份 → 当月最后一天
+    m = re.search(
+        r'(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})',
+        original, re.I
+    )
+    if m:
+        month_name, year = m.groups()
+        month = _month_to_num(month_name)
+        if month:
+            if month == 12:
+                d = date(int(year), 12, 31)
+            else:
+                d = date(int(year), month + 1, 1) - timedelta(days=1)
+            return original, d
+
+    # 季度
+    m = re.search(r'Q([1-4])\s*\'?(\d{2,4})', original, re.I)
+    if m:
+        q, y = m.groups()
+        year = int(y) if len(y) == 4 else 2000 + int(y)
+        end_day = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
+        month, day = end_day[int(q)]
+        return original, date(year, month, day)
+
+    # Summer / Mid / Late / Early / H1 / H2
+    m = re.search(r'(Summer|Mid|Late|Early|H[12])\s+(\d{4})', original, re.I)
+    if m:
+        season, year = m.groups()
+        year = int(year)
+        season = season.lower()
+        mapping = {
+            'summer': (8, 31), 'mid': (6, 30), 'late': (12, 31),
+            'early': (3, 31), 'h1': (6, 30), 'h2': (12, 31)
+        }
+        month, day = mapping.get(season, (12, 31))
+        return original, date(year, month, day)
+
+    # 纯年份
+    m = re.search(r'\b(20\d{2})\b', original)
+    if m:
+        return original, date(int(m.group(1)), 12, 31)
+    return None
+
+def translate_to_chinese(text: str) -> str:
+    """用 Gemini 翻译（与原脚本同一套模型）"""
+    if not text or not text.strip():
+        return text
+    prompt = f"""将下面英文医药术语/适应症完整译成简洁专业中文。
+只返回中文译文，不要解释、不要引号。
+原文：{text}
+"""
+    res = gemini_text(prompt, max_tokens=120)
+    return res if res else text
+
+async def scrape_bpiq_catalysts(exclude_tickers: set) -> List[Dict]:
+    """抓取 BPIQ，排除已在 RSS 中出现的 ticker"""
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        print("未安装 playwright，跳过 BPIQ 抓取。请执行: pip install playwright && playwright install chromium")
+        return []
+
+    items = []
+    today = date.today()
+    start_date = today - timedelta(days=DAYS_BEFORE)
+    end_date = today + timedelta(days=DAYS_AFTER)
+    print(f"[BPIQ] 时间窗口：{start_date} ~ {end_date}")
+
+    # 读取 BPIQ 历史去重
+    if not os.path.exists(BPIQ_SENT_DB_FILE):
+        open(BPIQ_SENT_DB_FILE, "w").close()
+    with open(BPIQ_SENT_DB_FILE, "r") as f:
+        bpiq_sent = set(line.strip() for line in f)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"]
+        )
+        context = await browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+            locale="en-US",
+            timezone_id="America/New_York",
+        )
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.chrome = { runtime: {} };
+        """)
+        page = await context.new_page()
+
+        print("[BPIQ] 正在打开页面...")
+        try:
+            await page.goto("https://app.bpiq.com/catalyst-calendar", wait_until="domcontentloaded", timeout=90000)
+        except Exception as e:
+            print(f"[BPIQ] 页面加载失败: {e}")
+            await browser.close()
+            return []
+
+        try:
+            await page.wait_for_selector("table", timeout=45000)
+        except Exception:
+            print("[BPIQ] 未检测到 table")
+
+        await asyncio.sleep(5 + random.uniform(1, 3))
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 3)")
+        await asyncio.sleep(2)
+
+        rows = await page.query_selector_all("table tbody tr") or await page.query_selector_all("tr")
+        print(f"[BPIQ] 找到 {len(rows)} 行")
+
+        for row in rows:
+            try:
+                cells = await row.query_selector_all("td")
+                if len(cells) < 5:
+                    continue
+
+                company_text = (await cells[0].inner_text()).strip()
+                ticker = company_text.split()[0] if company_text else ""
+                if not ticker or ticker in exclude_tickers:
+                    continue
+
+                company_link = ""
+                a_tag = await cells[0].query_selector("a")
+                if a_tag:
+                    href = await a_tag.get_attribute("href")
+                    if href:
+                        company_link = href if href.startswith("http") else f"https://app.bpiq.com{href}"
+
+                drug_en = re.sub(r'\s+', ' ', (await cells[2].inner_text()).strip())
+                drug_zh = translate_to_chinese(drug_en)
+
+                stage_en = re.sub(r'\s+', ' ', (await cells[3].inner_text()).strip())
+                stage_zh = translate_to_chinese(stage_en)
+
+                title = f"{drug_zh} {stage_zh}".strip()
+
+                date_cell = cells[4]
+                full_text = (await date_cell.inner_text()).strip()
+                date_match = re.search(
+                    r'((?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}(?:\s*-\s*\d{1,2})?,?\s+\d{4}|'
+                    r'(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}|'
+                    r'Q[1-4]\s*\'?\d{2,4}|'
+                    r'(?:Summer|Mid|Late|Early|H[12])\s+\d{4})',
+                    full_text, re.I
+                )
+                if not date_match:
+                    continue
+
+                date_raw = date_match.group(1)
+                parsed = parse_catalyst_date(date_raw)
+                if not parsed:
+                    continue
+                original_str, compare_date = parsed
+
+                if not (start_date <= compare_date <= end_date):
+                    continue
+
+                # BPIQ 自身去重：ticker|原始日期
+                dedup_key = f"{ticker}|{original_str}"
+                if dedup_key in bpiq_sent:
+                    continue
+
+                source_link = company_link
+                links = await date_cell.query_selector_all("a")
+                for link in links:
+                    href = await link.get_attribute("href")
+                    text = ((await link.inner_text()) or "").lower()
+                    if href and ("view source" in text or any(x in href for x in ["globenewswire", "prnewswire", "sec.gov", "businesswire"])):
+                        source_link = href
+                        break
+                    if href and href.startswith("http") and not source_link:
+                        source_link = href
+
+                items.append({
+                    "ticker": ticker,
+                    "date_raw": original_str,
+                    "date_parsed": compare_date,
+                    "title": title,
+                    "link": source_link or company_link or "https://app.bpiq.com/catalyst-calendar",
+                    "dedup_key": dedup_key,
+                })
+            except Exception:
+                continue
+
+        await browser.close()
+
+    items.sort(key=lambda x: x["date_parsed"])
+    return items
+
+def push_bpiq_to_telegram(items: List[Dict]):
+    if not items:
+        print("[BPIQ] 无符合条件的事件")
+        return
+
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    header = f"📅<b>{now_et.month}月{now_et.day}日 BPIQ 催化剂日历（共{len(items)}条）</b>\n\n"
+    footer = "\n#BPIQCatalyst"
+    full_msg = header
+    new_keys = []
+
+    for i, item in enumerate(items, 1):
+        item_str = f"{i}. 🚀{item['ticker']}\n"
+        item_str += f"   ⏰公布时间：{item['date_raw']}\n"
+        item_str += f"   📰内容标题：{item['title']}\n"
+        item_str += f"   🔗<a href='{item['link']}'>点击查看公告</a>\n"
+        if i < len(items):
+            item_str += "--------------------------------\n"
+
+        if len(full_msg) + len(item_str) + len(footer) > 3900:
+            send_telegram(full_msg + footer)
+            full_msg = "接上条续：\n\n" + item_str
+        else:
+            full_msg += item_str
+        new_keys.append(item["dedup_key"])
+
+    send_telegram(full_msg + footer)
+
+    with open(BPIQ_SENT_DB_FILE, "a") as f:
+        for key in new_keys:
+            f.write(key + "\n")
+    print(f"[BPIQ] 成功推送 {len(items)} 条")
+
+# ==================== 主流程 ====================
 def run_monitor():
     current_utc_ts = time.time()
     cutoff_ts = current_utc_ts - (HOURS_WINDOW * 3600)
@@ -285,13 +531,13 @@ def run_monitor():
 
     collected_items = []
     new_urls = []
+    rss_tickers = set()          # 本次 RSS 出现的 ticker，用于 BPIQ 去重
 
     for rss_url in RSS_URLS:
         feed = feedparser.parse(rss_url)
         for entry in feed.entries:
             if entry.link in sent_urls or entry.link in new_urls:
                 continue
-
             pub_ts = (
                 calendar.timegm(entry.published_parsed)
                 if hasattr(entry, "published_parsed")
@@ -299,7 +545,6 @@ def run_monitor():
             )
             if pub_ts < cutoff_ts:
                 continue
-
             title = entry.title
             title_lower = title.lower()
             if (
@@ -309,31 +554,28 @@ def run_monitor():
             ):
                 ticker_match = re.search(r"\|\s*([A-Z]+)\s+Stock News", title)
                 ticker = ticker_match.group(1) if ticker_match else "N/A"
+                rss_tickers.add(ticker)
 
                 english_title = clean_title(title)
                 chinese_title = translate_title(english_title)
-
                 dt_et = datetime.fromtimestamp(pub_ts, tz=ZoneInfo("UTC")).astimezone(
                     ZoneInfo("America/New_York")
                 )
                 pub_date_et = format_et_cn(dt_et)
-
                 body_text = get_article_body(entry.link)
                 event_time = (
                     analyze_event_time(english_title, body_text) if body_text else None
                 )
-
-                collected_items.append(
-                    {
-                        "ticker": ticker,
-                        "pub_date": pub_date_et,
-                        "event_time": event_time,
-                        "title": chinese_title,
-                        "link": entry.link,
-                    }
-                )
+                collected_items.append({
+                    "ticker": ticker,
+                    "pub_date": pub_date_et,
+                    "event_time": event_time,
+                    "title": chinese_title,
+                    "link": entry.link,
+                })
                 new_urls.append(entry.link)
 
+    # ---- 原有 RSS 推送 ----
     if collected_items:
         now_et = datetime.now(ZoneInfo("America/New_York"))
         header = (
@@ -341,7 +583,6 @@ def run_monitor():
             f"（共{len(collected_items)}条）</b>\n\n"
         )
         footer = "\n#ClinicalData"
-
         full_msg = header
         for i, item in enumerate(collected_items, 1):
             item_str = f"{i}. 🚀股票代码: ${item['ticker']}\n"
@@ -352,23 +593,29 @@ def run_monitor():
             item_str += f"   🔗<a href='{item['link']}'>点击查看公告</a>\n"
             if i < len(collected_items):
                 item_str += "--------------------------------\n"
-
             if len(full_msg) + len(item_str) + len(footer) > 3900:
                 send_telegram(full_msg + footer)
                 full_msg = "接上条续：\n\n" + item_str
             else:
                 full_msg += item_str
-
         send_telegram(full_msg + footer)
         with open(SENT_DB_FILE, "a") as f:
             for url in new_urls:
                 f.write(url + "\n")
-        print(
-            f"成功推送 {len(collected_items)} 条新闻至 {len(TELEGRAM_TARGETS)} 个目标。"
-        )
+        print(f"成功推送 {len(collected_items)} 条新闻至 {len(TELEGRAM_TARGETS)} 个目标。")
     else:
         print("未发现满足条件的新条目。")
 
+    # ---- BPIQ 部分（可开关） ----
+    if ENABLE_BPIQ:
+        print("\n[BPIQ] 开始抓取...")
+        try:
+            bpiq_items = asyncio.run(scrape_bpiq_catalysts(exclude_tickers=rss_tickers))
+            push_bpiq_to_telegram(bpiq_items)
+        except Exception as e:
+            print(f"[BPIQ] 抓取或推送失败: {e}")
+    else:
+        print("[BPIQ] 已关闭，跳过。")
 
 if __name__ == "__main__":
     run_monitor()
