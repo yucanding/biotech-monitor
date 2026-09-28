@@ -37,11 +37,9 @@ RSS_URLS = [
 SENT_DB_FILE = "sent_urls.txt"
 BPIQ_SENT_DB_FILE = "sent_bpiq.txt"
 
-# ---------- BPIQ 开关与时间窗口 ----------
-ENABLE_BPIQ = True       # 被反爬严重时改成 False
+ENABLE_BPIQ = True
 DAYS_BEFORE = 0
-DAYS_AFTER  = 1
-# ----------------------------------------
+DAYS_AFTER = 1
 
 PATTERN_ACTION = r"to (?:report|announce|discuss|showcase|present )"
 PATTERN_SUBJECT = r"data|phase|result|results|topline"
@@ -66,7 +64,7 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 _ACTIVE_MODEL = None
 _SKIP_MODELS = set()
 
-# ==================== 原有工具函数 ====================
+# ==================== 工具函数 ====================
 def _model_id(name: str) -> str:
     return name.split("/")[-1] if name else ""
 
@@ -119,15 +117,9 @@ def pick_model():
                 return mid
         except Exception as e:
             msg = str(e)
-            if "404" in msg or "NOT_FOUND" in msg:
-                print(f"跳过不可用模型 {mid}")
+            if any(x in msg for x in ["404", "NOT_FOUND", "503", "UNAVAILABLE", "429"]):
                 _SKIP_MODELS.add(mid)
                 continue
-            if "503" in msg or "UNAVAILABLE" in msg or "429" in msg:
-                print(f"{mid} 限流/高峰，换下一个")
-                _SKIP_MODELS.add(mid)
-                continue
-            print(f"{mid} 探测失败: {e}")
             _SKIP_MODELS.add(mid)
     raise RuntimeError("当前没有可用的 Gemini 文本模型，请稍后重跑")
 
@@ -252,14 +244,13 @@ def format_et_cn(dt):
     return f"{dt.year}年{dt.month}月{dt.day}日 {dt.strftime('%H:%M')} ET"
 
 def kill_browser_processes():
-    """清理 Playwright 残留进程，防止 Action 卡住"""
     try:
         subprocess.run(["pkill", "-f", "chrome"], capture_output=True)
         subprocess.run(["pkill", "-f", "chromium"], capture_output=True)
     except Exception:
         pass
 
-# ==================== BPIQ 相关 ====================
+# ==================== BPIQ ====================
 def _month_to_num(name: str) -> Optional[int]:
     mapping = {
         'jan': 1, 'january': 1, 'feb': 2, 'february': 2,
@@ -374,11 +365,7 @@ async def scrape_bpiq_catalysts(exclude_tickers: set) -> List[Dict]:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ]
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"]
             )
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 720},
@@ -386,7 +373,7 @@ async def scrape_bpiq_catalysts(exclude_tickers: set) -> List[Dict]:
             )
             page = await context.new_page()
 
-            print("[BPIQ] 正在打开页面（最多 45 秒）...")
+            print("[BPIQ] 打开页面...")
             try:
                 await page.goto(
                     "https://app.bpiq.com/catalyst-calendar",
@@ -394,18 +381,17 @@ async def scrape_bpiq_catalysts(exclude_tickers: set) -> List[Dict]:
                     timeout=45000
                 )
             except Exception as e:
-                print(f"[BPIQ] 页面加载超时/失败，跳过: {e}")
+                print(f"[BPIQ] 页面加载失败: {e}")
                 return []
 
             try:
                 await page.wait_for_selector("table", timeout=20000)
                 print("[BPIQ] 检测到 table")
             except Exception:
-                print("[BPIQ] 未检测到 table（可能被反爬拦截），跳过")
+                print("[BPIQ] 未检测到 table，跳过")
                 return []
 
             await asyncio.sleep(3)
-
             rows = await page.query_selector_all("table tbody tr") or await page.query_selector_all("tr")
             print(f"[BPIQ] 找到 {len(rows)} 行")
 
@@ -472,20 +458,19 @@ async def scrape_bpiq_catalysts(exclude_tickers: set) -> List[Dict]:
                         if href and href.startswith("http") and not source_link:
                             source_link = href
 
-                    # 统一成与 StockTitan 相同的字段结构
+                    # 统一成 StockTitan 字段结构
                     items.append({
                         "ticker": ticker,
-                        "pub_date": pub_date_str,       # 新闻时间：当前 ET
-                        "event_time": original_str,     # 公布时间：BPIQ 原始日期
+                        "pub_date": pub_date_str,
+                        "event_time": original_str,
                         "title": title,
                         "link": source_link or company_link or "https://app.bpiq.com/catalyst-calendar",
                         "dedup_key": dedup_key,
-                        "source": "bpiq",
                     })
                 except Exception:
                     continue
     except Exception as e:
-        print(f"[BPIQ] 整体异常，跳过: {e}")
+        print(f"[BPIQ] 异常: {e}")
         return []
     finally:
         try:
@@ -495,12 +480,10 @@ async def scrape_bpiq_catalysts(exclude_tickers: set) -> List[Dict]:
             pass
         kill_browser_processes()
 
-    items.sort(key=lambda x: x.get("event_time") or "")
     return items
 
-# ==================== 统一推送 ====================
 def push_combined(items: List[Dict], bpiq_keys: List[str]):
-    """StockTitan + BPIQ 合并推送，格式统一"""
+    """合并推送，格式与 StockTitan 一致"""
     if not items:
         print("无符合条件的事件")
         return
@@ -531,13 +514,12 @@ def push_combined(items: List[Dict], bpiq_keys: List[str]):
 
     send_telegram(full_msg + footer)
 
-    # 写入 BPIQ 去重记录
     if bpiq_keys:
         with open(BPIQ_SENT_DB_FILE, "a") as f:
             for key in bpiq_keys:
                 f.write(key + "\n")
 
-    print(f"成功推送 {len(items)} 条（含 BPIQ {len(bpiq_keys)} 条）")
+    print(f"成功推送 {len(items)} 条（其中 BPIQ {len(bpiq_keys)} 条）")
 
 # ==================== 主流程 ====================
 def run_monitor():
@@ -549,11 +531,11 @@ def run_monitor():
     with open(SENT_DB_FILE, "r") as f:
         sent_urls = set(line.strip() for line in f)
 
-    collected_items = []   # 最终合并列表
+    collected_items = []
     new_urls = []
     rss_tickers = set()
 
-    # ---------- 1. StockTitan RSS ----------
+    # ---- 1. StockTitan ----
     for rss_url in RSS_URLS:
         feed = feedparser.parse(rss_url)
         for entry in feed.entries:
@@ -584,20 +566,18 @@ def run_monitor():
                 )
                 pub_date_et = format_et_cn(dt_et)
                 body_text = get_article_body(entry.link)
-                event_time = (
-                    analyze_event_time(english_title, body_text) if body_text else None
-                )
+                event_time = analyze_event_time(english_title, body_text) if body_text else None
+
                 collected_items.append({
                     "ticker": ticker,
                     "pub_date": pub_date_et,
                     "event_time": event_time,
                     "title": chinese_title,
                     "link": entry.link,
-                    "source": "rss",
                 })
                 new_urls.append(entry.link)
 
-    # ---------- 2. BPIQ ----------
+    # ---- 2. BPIQ（带超时） ----
     bpiq_keys = []
     if ENABLE_BPIQ:
         print("\n[BPIQ] 开始抓取...")
@@ -605,32 +585,35 @@ def run_monitor():
             bpiq_items = asyncio.run(
                 asyncio.wait_for(
                     scrape_bpiq_catalysts(exclude_tickers=rss_tickers),
-                    timeout=90
+                    timeout=120
                 )
             )
             for it in bpiq_items:
                 collected_items.append(it)
                 bpiq_keys.append(it["dedup_key"])
         except asyncio.TimeoutError:
-            print("[BPIQ] 整体超时（90秒），强制跳过")
+            print("[BPIQ] 超时，跳过")
         except Exception as e:
-            print(f"[BPIQ] 抓取失败（已跳过）: {e}")
+            print(f"[BPIQ] 失败: {e}")
         finally:
             kill_browser_processes()
     else:
-        print("[BPIQ] 已关闭，跳过。")
+        print("[BPIQ] 已关闭")
 
-    # ---------- 3. 统一推送 ----------
+    # ---- 3. 合并推送 ----
     if collected_items:
         push_combined(collected_items, bpiq_keys)
-        # 保存 RSS 去重
         with open(SENT_DB_FILE, "a") as f:
             for url in new_urls:
                 f.write(url + "\n")
     else:
-        print("未发现满足条件的新条目。")
+        print("未发现满足条件的新条目")
 
 if __name__ == "__main__":
-    run_monitor()
-    # 强制退出，防止 Playwright 残留进程拖住 GitHub Action
-    os._exit(0)
+    try:
+        run_monitor()
+    except Exception as e:
+        print(f"主流程异常: {e}")
+    finally:
+        kill_browser_processes()
+        os._exit(0)
