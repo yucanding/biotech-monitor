@@ -18,7 +18,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install feedparser cloudscraper beautifulsoup4 google-genai requests playwright
+          pip install feedparser cloudscraper beautifulsoup4 google-genai requests playwright translators
           playwright install chromium --with-deps
 
       - name: Run logic
