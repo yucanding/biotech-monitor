@@ -7,13 +7,13 @@ import random
 import os
 import requests
 import asyncio
+import subprocess
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from bs4 import BeautifulSoup
 from google import genai
 from google.genai import types
 from typing import Optional, List, Dict, Tuple
-from urllib.parse import urlparse
 
 # ==================== 环境变量 ====================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -35,12 +35,12 @@ RSS_URLS = [
     "https://www.stocktitan.net/rss-fda-approvals",
 ]
 SENT_DB_FILE = "sent_urls.txt"
-BPIQ_SENT_DB_FILE = "sent_bpiq.txt"          # BPIQ 专用去重文件
+BPIQ_SENT_DB_FILE = "sent_bpiq.txt"
 
 # ---------- BPIQ 开关与时间窗口 ----------
-ENABLE_BPIQ = True       # True=推送 BPIQ；False=只跑原来的 RSS
-DAYS_BEFORE = 0          # 往前几天（0=今天）
-DAYS_AFTER  = 1          # 往后几天（0=今天）
+ENABLE_BPIQ = True       # 被反爬严重时改成 False
+DAYS_BEFORE = 0
+DAYS_AFTER  = 1
 # ----------------------------------------
 
 PATTERN_ACTION = r"to (?:report|announce|discuss|showcase|present )"
@@ -66,7 +66,7 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 _ACTIVE_MODEL = None
 _SKIP_MODELS = set()
 
-# ==================== 原有工具函数（保持不变） ====================
+# ==================== 原有工具函数 ====================
 def _model_id(name: str) -> str:
     return name.split("/")[-1] if name else ""
 
@@ -251,7 +251,15 @@ def clean_title(title):
 def format_et_cn(dt):
     return f"{dt.year}年{dt.month}月{dt.day}日 {dt.strftime('%H:%M')} ET"
 
-# ==================== BPIQ 相关函数 ====================
+def kill_browser_processes():
+    """清理 Playwright 残留进程，防止 Action 卡住"""
+    try:
+        subprocess.run(["pkill", "-f", "chrome"], capture_output=True)
+        subprocess.run(["pkill", "-f", "chromium"], capture_output=True)
+    except Exception:
+        pass
+
+# ==================== BPIQ 相关 ====================
 def _month_to_num(name: str) -> Optional[int]:
     mapping = {
         'jan': 1, 'january': 1, 'feb': 2, 'february': 2,
@@ -268,7 +276,6 @@ def parse_catalyst_date(date_str: str) -> Optional[Tuple[str, date]]:
         return None
     original = date_str.strip()
 
-    # 精确单一日期
     m = re.search(
         r'(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),?\s+(\d{4})',
         original, re.I
@@ -282,7 +289,6 @@ def parse_catalyst_date(date_str: str) -> Optional[Tuple[str, date]]:
             except ValueError:
                 pass
 
-    # 日期区间 → 取最晚一天
     m = re.search(
         r'(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s*-\s*(\d{1,2}),?\s+(\d{4})',
         original, re.I
@@ -296,7 +302,6 @@ def parse_catalyst_date(date_str: str) -> Optional[Tuple[str, date]]:
             except ValueError:
                 pass
 
-    # 只有月份 → 当月最后一天
     m = re.search(
         r'(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})',
         original, re.I
@@ -311,7 +316,6 @@ def parse_catalyst_date(date_str: str) -> Optional[Tuple[str, date]]:
                 d = date(int(year), month + 1, 1) - timedelta(days=1)
             return original, d
 
-    # 季度
     m = re.search(r'Q([1-4])\s*\'?(\d{2,4})', original, re.I)
     if m:
         q, y = m.groups()
@@ -320,7 +324,6 @@ def parse_catalyst_date(date_str: str) -> Optional[Tuple[str, date]]:
         month, day = end_day[int(q)]
         return original, date(year, month, day)
 
-    # Summer / Mid / Late / Early / H1 / H2
     m = re.search(r'(Summer|Mid|Late|Early|H[12])\s+(\d{4})', original, re.I)
     if m:
         season, year = m.groups()
@@ -333,14 +336,12 @@ def parse_catalyst_date(date_str: str) -> Optional[Tuple[str, date]]:
         month, day = mapping.get(season, (12, 31))
         return original, date(year, month, day)
 
-    # 纯年份
     m = re.search(r'\b(20\d{2})\b', original)
     if m:
         return original, date(int(m.group(1)), 12, 31)
     return None
 
 def translate_to_chinese(text: str) -> str:
-    """用 Gemini 翻译（与原脚本同一套模型）"""
     if not text or not text.strip():
         return text
     prompt = f"""将下面英文医药术语/适应症完整译成简洁专业中文。
@@ -351,11 +352,10 @@ def translate_to_chinese(text: str) -> str:
     return res if res else text
 
 async def scrape_bpiq_catalysts(exclude_tickers: set) -> List[Dict]:
-    """抓取 BPIQ，排除已在 RSS 中出现的 ticker"""
     try:
         from playwright.async_api import async_playwright
     except ImportError:
-        print("未安装 playwright，跳过 BPIQ 抓取。请执行: pip install playwright && playwright install chromium")
+        print("[BPIQ] 未安装 playwright，跳过")
         return []
 
     items = []
@@ -364,143 +364,161 @@ async def scrape_bpiq_catalysts(exclude_tickers: set) -> List[Dict]:
     end_date = today + timedelta(days=DAYS_AFTER)
     print(f"[BPIQ] 时间窗口：{start_date} ~ {end_date}")
 
-    # 读取 BPIQ 历史去重
     if not os.path.exists(BPIQ_SENT_DB_FILE):
         open(BPIQ_SENT_DB_FILE, "w").close()
     with open(BPIQ_SENT_DB_FILE, "r") as f:
         bpiq_sent = set(line.strip() for line in f)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"]
-        )
-        context = await browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-            locale="en-US",
-            timezone_id="America/New_York",
-        )
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            window.chrome = { runtime: {} };
-        """)
-        page = await context.new_page()
+    browser = None
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ]
+            )
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 720},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+            )
+            page = await context.new_page()
 
-        print("[BPIQ] 正在打开页面...")
-        try:
-            await page.goto("https://app.bpiq.com/catalyst-calendar", wait_until="domcontentloaded", timeout=90000)
-        except Exception as e:
-            print(f"[BPIQ] 页面加载失败: {e}")
-            await browser.close()
-            return []
-
-        try:
-            await page.wait_for_selector("table", timeout=45000)
-        except Exception:
-            print("[BPIQ] 未检测到 table")
-
-        await asyncio.sleep(5 + random.uniform(1, 3))
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 3)")
-        await asyncio.sleep(2)
-
-        rows = await page.query_selector_all("table tbody tr") or await page.query_selector_all("tr")
-        print(f"[BPIQ] 找到 {len(rows)} 行")
-
-        for row in rows:
+            print("[BPIQ] 正在打开页面（最多 45 秒）...")
             try:
-                cells = await row.query_selector_all("td")
-                if len(cells) < 5:
-                    continue
-
-                company_text = (await cells[0].inner_text()).strip()
-                ticker = company_text.split()[0] if company_text else ""
-                if not ticker or ticker in exclude_tickers:
-                    continue
-
-                company_link = ""
-                a_tag = await cells[0].query_selector("a")
-                if a_tag:
-                    href = await a_tag.get_attribute("href")
-                    if href:
-                        company_link = href if href.startswith("http") else f"https://app.bpiq.com{href}"
-
-                drug_en = re.sub(r'\s+', ' ', (await cells[2].inner_text()).strip())
-                drug_zh = translate_to_chinese(drug_en)
-
-                stage_en = re.sub(r'\s+', ' ', (await cells[3].inner_text()).strip())
-                stage_zh = translate_to_chinese(stage_en)
-
-                title = f"{drug_zh} {stage_zh}".strip()
-
-                date_cell = cells[4]
-                full_text = (await date_cell.inner_text()).strip()
-                date_match = re.search(
-                    r'((?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}(?:\s*-\s*\d{1,2})?,?\s+\d{4}|'
-                    r'(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}|'
-                    r'Q[1-4]\s*\'?\d{2,4}|'
-                    r'(?:Summer|Mid|Late|Early|H[12])\s+\d{4})',
-                    full_text, re.I
+                await page.goto(
+                    "https://app.bpiq.com/catalyst-calendar",
+                    wait_until="domcontentloaded",
+                    timeout=45000
                 )
-                if not date_match:
-                    continue
+            except Exception as e:
+                print(f"[BPIQ] 页面加载超时/失败，跳过: {e}")
+                return []
 
-                date_raw = date_match.group(1)
-                parsed = parse_catalyst_date(date_raw)
-                if not parsed:
-                    continue
-                original_str, compare_date = parsed
-
-                if not (start_date <= compare_date <= end_date):
-                    continue
-
-                # BPIQ 自身去重：ticker|原始日期
-                dedup_key = f"{ticker}|{original_str}"
-                if dedup_key in bpiq_sent:
-                    continue
-
-                source_link = company_link
-                links = await date_cell.query_selector_all("a")
-                for link in links:
-                    href = await link.get_attribute("href")
-                    text = ((await link.inner_text()) or "").lower()
-                    if href and ("view source" in text or any(x in href for x in ["globenewswire", "prnewswire", "sec.gov", "businesswire"])):
-                        source_link = href
-                        break
-                    if href and href.startswith("http") and not source_link:
-                        source_link = href
-
-                items.append({
-                    "ticker": ticker,
-                    "date_raw": original_str,
-                    "date_parsed": compare_date,
-                    "title": title,
-                    "link": source_link or company_link or "https://app.bpiq.com/catalyst-calendar",
-                    "dedup_key": dedup_key,
-                })
+            try:
+                await page.wait_for_selector("table", timeout=20000)
+                print("[BPIQ] 检测到 table")
             except Exception:
-                continue
+                print("[BPIQ] 未检测到 table（可能被反爬拦截），跳过")
+                return []
 
-        await browser.close()
+            await asyncio.sleep(3)
 
-    items.sort(key=lambda x: x["date_parsed"])
+            rows = await page.query_selector_all("table tbody tr") or await page.query_selector_all("tr")
+            print(f"[BPIQ] 找到 {len(rows)} 行")
+
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+            pub_date_str = format_et_cn(now_et)
+
+            for row in rows:
+                try:
+                    cells = await row.query_selector_all("td")
+                    if len(cells) < 5:
+                        continue
+
+                    company_text = (await cells[0].inner_text()).strip()
+                    ticker = company_text.split()[0] if company_text else ""
+                    if not ticker or ticker in exclude_tickers:
+                        continue
+
+                    company_link = ""
+                    a_tag = await cells[0].query_selector("a")
+                    if a_tag:
+                        href = await a_tag.get_attribute("href")
+                        if href:
+                            company_link = href if href.startswith("http") else f"https://app.bpiq.com{href}"
+
+                    drug_en = re.sub(r'\s+', ' ', (await cells[2].inner_text()).strip())
+                    stage_en = re.sub(r'\s+', ' ', (await cells[3].inner_text()).strip())
+                    drug_zh = translate_to_chinese(drug_en)
+                    stage_zh = translate_to_chinese(stage_en)
+                    title = f"{drug_zh} {stage_zh}".strip()
+
+                    date_cell = cells[4]
+                    full_text = (await date_cell.inner_text()).strip()
+                    date_match = re.search(
+                        r'((?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}(?:\s*-\s*\d{1,2})?,?\s+\d{4}|'
+                        r'(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}|'
+                        r'Q[1-4]\s*\'?\d{2,4}|'
+                        r'(?:Summer|Mid|Late|Early|H[12])\s+\d{4})',
+                        full_text, re.I
+                    )
+                    if not date_match:
+                        continue
+
+                    date_raw = date_match.group(1)
+                    parsed = parse_catalyst_date(date_raw)
+                    if not parsed:
+                        continue
+                    original_str, compare_date = parsed
+
+                    if not (start_date <= compare_date <= end_date):
+                        continue
+
+                    dedup_key = f"{ticker}|{original_str}"
+                    if dedup_key in bpiq_sent:
+                        continue
+
+                    source_link = company_link
+                    links = await date_cell.query_selector_all("a")
+                    for link in links:
+                        href = await link.get_attribute("href")
+                        text = ((await link.inner_text()) or "").lower()
+                        if href and ("view source" in text or any(x in href for x in ["globenewswire", "prnewswire", "sec.gov", "businesswire"])):
+                            source_link = href
+                            break
+                        if href and href.startswith("http") and not source_link:
+                            source_link = href
+
+                    # 统一成与 StockTitan 相同的字段结构
+                    items.append({
+                        "ticker": ticker,
+                        "pub_date": pub_date_str,       # 新闻时间：当前 ET
+                        "event_time": original_str,     # 公布时间：BPIQ 原始日期
+                        "title": title,
+                        "link": source_link or company_link or "https://app.bpiq.com/catalyst-calendar",
+                        "dedup_key": dedup_key,
+                        "source": "bpiq",
+                    })
+                except Exception:
+                    continue
+    except Exception as e:
+        print(f"[BPIQ] 整体异常，跳过: {e}")
+        return []
+    finally:
+        try:
+            if browser:
+                await browser.close()
+        except Exception:
+            pass
+        kill_browser_processes()
+
+    items.sort(key=lambda x: x.get("event_time") or "")
     return items
 
-def push_bpiq_to_telegram(items: List[Dict]):
+# ==================== 统一推送 ====================
+def push_combined(items: List[Dict], bpiq_keys: List[str]):
+    """StockTitan + BPIQ 合并推送，格式统一"""
     if not items:
-        print("[BPIQ] 无符合条件的事件")
+        print("无符合条件的事件")
         return
 
     now_et = datetime.now(ZoneInfo("America/New_York"))
-    header = f"📅<b>{now_et.month}月{now_et.day}日 BPIQ 催化剂日历（共{len(items)}条）</b>\n\n"
-    footer = "\n#BPIQCatalyst"
+    header = (
+        f"🚨<b>{now_et.month}月{now_et.day}日医药股数据发布预警"
+        f"（共{len(items)}条）</b>\n\n"
+    )
+    footer = "\n#ClinicalData"
     full_msg = header
-    new_keys = []
 
     for i, item in enumerate(items, 1):
-        item_str = f"{i}. 🚀{item['ticker']}\n"
-        item_str += f"   ⏰公布时间：{item['date_raw']}\n"
-        item_str += f"   📰内容标题：{item['title']}\n"
+        item_str = f"{i}. 🚀股票代码: ${item['ticker']}\n"
+        item_str += f"   📅新闻时间: {item['pub_date']}\n"
+        if item.get("event_time"):
+            item_str += f"   ⏰公布时间: {item['event_time']}\n"
+        item_str += f"   📰内容标题: {item['title']}\n"
         item_str += f"   🔗<a href='{item['link']}'>点击查看公告</a>\n"
         if i < len(items):
             item_str += "--------------------------------\n"
@@ -510,14 +528,16 @@ def push_bpiq_to_telegram(items: List[Dict]):
             full_msg = "接上条续：\n\n" + item_str
         else:
             full_msg += item_str
-        new_keys.append(item["dedup_key"])
 
     send_telegram(full_msg + footer)
 
-    with open(BPIQ_SENT_DB_FILE, "a") as f:
-        for key in new_keys:
-            f.write(key + "\n")
-    print(f"[BPIQ] 成功推送 {len(items)} 条")
+    # 写入 BPIQ 去重记录
+    if bpiq_keys:
+        with open(BPIQ_SENT_DB_FILE, "a") as f:
+            for key in bpiq_keys:
+                f.write(key + "\n")
+
+    print(f"成功推送 {len(items)} 条（含 BPIQ {len(bpiq_keys)} 条）")
 
 # ==================== 主流程 ====================
 def run_monitor():
@@ -529,10 +549,11 @@ def run_monitor():
     with open(SENT_DB_FILE, "r") as f:
         sent_urls = set(line.strip() for line in f)
 
-    collected_items = []
+    collected_items = []   # 最终合并列表
     new_urls = []
-    rss_tickers = set()          # 本次 RSS 出现的 ticker，用于 BPIQ 去重
+    rss_tickers = set()
 
+    # ---------- 1. StockTitan RSS ----------
     for rss_url in RSS_URLS:
         feed = feedparser.parse(rss_url)
         for entry in feed.entries:
@@ -572,50 +593,44 @@ def run_monitor():
                     "event_time": event_time,
                     "title": chinese_title,
                     "link": entry.link,
+                    "source": "rss",
                 })
                 new_urls.append(entry.link)
 
-    # ---- 原有 RSS 推送 ----
-    if collected_items:
-        now_et = datetime.now(ZoneInfo("America/New_York"))
-        header = (
-            f"🚨<b>{now_et.month}月{now_et.day}日医药股数据发布预警"
-            f"（共{len(collected_items)}条）</b>\n\n"
-        )
-        footer = "\n#ClinicalData"
-        full_msg = header
-        for i, item in enumerate(collected_items, 1):
-            item_str = f"{i}. 🚀股票代码: ${item['ticker']}\n"
-            item_str += f"   📅新闻时间: {item['pub_date']}\n"
-            if item["event_time"]:
-                item_str += f"   ⏰公布时间: {item['event_time']}\n"
-            item_str += f"   📰内容标题: {item['title']}\n"
-            item_str += f"   🔗<a href='{item['link']}'>点击查看公告</a>\n"
-            if i < len(collected_items):
-                item_str += "--------------------------------\n"
-            if len(full_msg) + len(item_str) + len(footer) > 3900:
-                send_telegram(full_msg + footer)
-                full_msg = "接上条续：\n\n" + item_str
-            else:
-                full_msg += item_str
-        send_telegram(full_msg + footer)
-        with open(SENT_DB_FILE, "a") as f:
-            for url in new_urls:
-                f.write(url + "\n")
-        print(f"成功推送 {len(collected_items)} 条新闻至 {len(TELEGRAM_TARGETS)} 个目标。")
-    else:
-        print("未发现满足条件的新条目。")
-
-    # ---- BPIQ 部分（可开关） ----
+    # ---------- 2. BPIQ ----------
+    bpiq_keys = []
     if ENABLE_BPIQ:
         print("\n[BPIQ] 开始抓取...")
         try:
-            bpiq_items = asyncio.run(scrape_bpiq_catalysts(exclude_tickers=rss_tickers))
-            push_bpiq_to_telegram(bpiq_items)
+            bpiq_items = asyncio.run(
+                asyncio.wait_for(
+                    scrape_bpiq_catalysts(exclude_tickers=rss_tickers),
+                    timeout=90
+                )
+            )
+            for it in bpiq_items:
+                collected_items.append(it)
+                bpiq_keys.append(it["dedup_key"])
+        except asyncio.TimeoutError:
+            print("[BPIQ] 整体超时（90秒），强制跳过")
         except Exception as e:
-            print(f"[BPIQ] 抓取或推送失败: {e}")
+            print(f"[BPIQ] 抓取失败（已跳过）: {e}")
+        finally:
+            kill_browser_processes()
     else:
         print("[BPIQ] 已关闭，跳过。")
 
+    # ---------- 3. 统一推送 ----------
+    if collected_items:
+        push_combined(collected_items, bpiq_keys)
+        # 保存 RSS 去重
+        with open(SENT_DB_FILE, "a") as f:
+            for url in new_urls:
+                f.write(url + "\n")
+    else:
+        print("未发现满足条件的新条目。")
+
 if __name__ == "__main__":
     run_monitor()
+    # 强制退出，防止 Playwright 残留进程拖住 GitHub Action
+    os._exit(0)
