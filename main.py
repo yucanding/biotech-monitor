@@ -607,13 +607,20 @@ def run_monitor():
             for url in new_urls:
                 f.write(url + "\n")
     else:
-        print("未发现满足条件的新条目")
+        print("未发现满足条件的新条目（RSS 与 BPIQ 均为空）", flush=True)
+        print(f"RSS 条数相关: new_urls={len(new_urls)}, rss_tickers={rss_tickers}", flush=True)
+        print(f"BPIQ keys 数: {len(bpiq_keys)}", flush=True)
 
 if __name__ == "__main__":
     try:
         run_monitor()
     except Exception as e:
-        print(f"主流程异常: {e}")
+        print(f"主流程异常: {e}", flush=True)
     finally:
         kill_browser_processes()
+        import sys
+        sys.stdout.flush()
+        sys.stderr.flush()
+        # 给 Telegram / 日志一点收尾时间，再退出
+        time.sleep(2)
         os._exit(0)
