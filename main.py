@@ -612,10 +612,71 @@ def push_combined(items: List[Dict], bpiq_keys: List[str]):
 
     print(f"成功推送 {len(items)} 条（其中 BPIQ {len(bpiq_keys)} 条）", flush=True)
 
+def parse_rss_event_date(event_time: str) -> Optional[date]:
+    """
+    把 Gemini 抽出的公布时间尽量解析成 date，用于 StockTitan 近3天过滤。
+    解析不了（如「四季度」「ASCO年会」）返回 None → 不推送。
+    """
+    if not event_time or not str(event_time).strip():
+        return None
+
+    text = str(event_time).strip()
+
+    # 2026年10月15日
+    m = re.search(r"(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", text)
+    if m:
+        y, mo, d = map(int, m.groups())
+        try:
+            return date(y, mo, d)
+        except ValueError:
+            return None
+
+    # 2026年10月（无日 → 当月最后一天，通常会超出3天窗口被滤掉）
+    m = re.search(r"(20\d{2})\s*年\s*(\d{1,2})\s*月", text)
+    if m:
+        y, mo = map(int, m.groups())
+        try:
+            if mo == 12:
+                return date(y, 12, 31)
+            return date(y, mo + 1, 1) - timedelta(days=1)
+        except ValueError:
+            return None
+
+    # October 15, 2026 / Oct 15, 2026
+    m = re.search(
+        r"(January|February|March|April|May|June|July|August|September|October|November|December|"
+        r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),?\s+(20\d{2})",
+        text,
+        re.I,
+    )
+    if m:
+        month_name, day, year = m.groups()
+        month = _month_to_num(month_name)
+        if month:
+            try:
+                return date(int(year), month, int(day))
+            except ValueError:
+                return None
+
+    # 2026-10-15
+    m = re.search(r"(20\d{2})-(\d{1,2})-(\d{1,2})", text)
+    if m:
+        y, mo, d = map(int, m.groups())
+        try:
+            return date(y, mo, d)
+        except ValueError:
+            return None
+
+    return None
+
 # ==================== 主流程 ====================
 def run_monitor():
     current_utc_ts = time.time()
     cutoff_ts = current_utc_ts - (HOURS_WINDOW * 3600)
+
+    # StockTitan：公布时间只保留今天起最多 3 天内
+    rss_event_start = date.today()
+    rss_event_end = date.today() + timedelta(days=3)
 
     if not os.path.exists(SENT_DB_FILE):
         open(SENT_DB_FILE, "w").close()
@@ -654,33 +715,35 @@ def run_monitor():
             ):
                 ticker_match = re.search(r"\|\s*([A-Z]+)\s+Stock News", title)
                 ticker = ticker_match.group(1) if ticker_match else "N/A"
-                rss_tickers.add(ticker)
 
                 english_title = clean_title(title)
                 chinese_title = translate_title(english_title)
 
-                dt_et = datetime.fromtimestamp(
-                    pub_ts,
-                    tz=ZoneInfo("UTC")
-                ).astimezone(
-                    ZoneInfo("America/New_York")
-                )
-
-                pub_date_et = format_et_cn(dt_et)
                 body_text = get_article_body(entry.link)
                 event_time = analyze_event_time(english_title, body_text) if body_text else None
 
+                # 必须有可解析的公布时间，且落在今天～今天+3天
+                event_date = parse_rss_event_date(event_time) if event_time else None
+                if event_date is None:
+                    print(f"[RSS] 跳过（无明确近日期）: {ticker} | {event_time}", flush=True)
+                    continue
+                if not (rss_event_start <= event_date <= rss_event_end):
+                    print(
+                        f"[RSS] 跳过（超出3天）: {ticker} | {event_time} -> {event_date}",
+                        flush=True,
+                    )
+                    continue
+
+                rss_tickers.add(ticker)
                 collected_items.append({
                     "ticker": ticker,
-                    "pub_date": pub_date_et,
                     "event_time": event_time,
                     "title": chinese_title,
                     "link": entry.link,
                 })
-
                 new_urls.append(entry.link)
 
-    # ---- 2. BPIQ ----
+    # ---- 2. BPIQ（逻辑不变） ----
     bpiq_keys = []
 
     if ENABLE_BPIQ:
