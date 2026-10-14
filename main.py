@@ -595,7 +595,7 @@ def push_combined(items: List[Dict], bpiq_keys: List[str]):
         item_str += f"   🔗<a href='{item['link']}'>点击查看公告</a>\n"
 
         if i < len(items):
-            item_str += "--------------------------------\n"
+            item_str += " \n"
 
         if len(full_msg) + len(item_str) + len(footer) > 3900:
             send_telegram(full_msg + footer)
