@@ -40,4 +40,3 @@ VSTM|October 14, 2026
 CLRB|October 15, 2026
 PDSB|October 15, 2026
 RHHBY|October 15, 2026
-VTRS|October 17, 2026
