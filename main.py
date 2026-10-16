@@ -260,7 +260,56 @@ def kill_browser_processes():
     except Exception:
         pass
 
-# ==================== BPIQ 翻译 ====================
+# ==================== BPIQ 清洗 / 翻译 ====================
+def clean_scraped_cell(text: str) -> str:
+    """去掉 BPIQ 页面混入的付费墙 / Mover 分析废话"""
+    if not text:
+        return ""
+
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # 付费墙
+    text = re.sub(r"Log in or subscribe to Elite to view.*$", "", text, flags=re.I)
+    text = re.sub(r"登录或订阅\s*Elite.*$", "", text, flags=re.I)
+
+    # Mover / 概率分析英文碎片
+    junk_patterns = [
+        r"Mover Analysis.*$",
+        r"Full Analysis.*$",
+        r"Simplified metrics.*$",
+        r"Odds lean.*$",
+        r"its position is.*$",
+        r"Center-right means.*$",
+        r"Center-left means.*$",
+        r"Negative\s+\d+.*Positive\s+\d+.*$",
+        r"\d{1,3}[–\-]\d{1,3}%\s*(Negative|Mixed|Positive).*stock move.*$",
+        r"stock (move|fluctuation).*$",
+    ]
+    for p in junk_patterns:
+        text = re.sub(p, "", text, flags=re.I)
+
+    # 中文脏数据（翻译后残留）
+    text = re.sub(r"移动者分析.*$", "", text)
+    text = re.sub(r"完整分析.*$", "", text)
+    text = re.sub(r"精简指标.*$", "", text)
+    text = re.sub(r"赔率倾向.*$", "", text)
+    text = re.sub(r"负面\s*\d+.*正面\s*\d+.*$", "", text)
+    text = re.sub(r"股票波动.*$", "", text)
+
+    text = re.sub(r"\s+", " ", text).strip(" -–—,:;/|&")
+    return text
+
+def is_junk_title(title: str) -> bool:
+    """标题仍含废话则整条丢弃"""
+    if not title:
+        return True
+    t = title.lower()
+    markers = [
+        "elite", "mover analysis", "股票波动", "赔率", "移动者分析",
+        "精简指标", "完整分析", "log in or subscribe", "登录或订阅",
+    ]
+    return any(m in t for m in markers)
+
 def translate_bpiq_text(text: str) -> str:
     if not text or not text.strip():
         return text
@@ -270,7 +319,6 @@ def translate_bpiq_text(text: str) -> str:
         return text
 
     engines = ["bing", "alibaba", "baidu", "sogou", "tencent"]
-
     for engine in engines:
         try:
             result = ts.translate_text(
@@ -295,11 +343,8 @@ def clean_stage_event(text: str) -> str:
     text = re.sub(r"\bdata\s+readout\b", "", text, flags=re.I)
     text = re.sub(r"\bapproval\s+decision\b", "", text, flags=re.I)
     text = re.sub(r"\s+", " ", text).strip()
-
-    # 删除关键词移除后残留在开头/结尾的标点
     text = re.sub(r"^\s*[-–—,:;/|&]+\s*", "", text)
     text = re.sub(r"\s*[-–—,:;/|&]+\s*$", "", text)
-
     return text.strip()
 
 # ==================== BPIQ 日期解析 ====================
@@ -452,7 +497,6 @@ async def scrape_bpiq_catalysts(exclude_tickers: set) -> List[Dict]:
             rows = await page.query_selector_all("table tbody tr") or await page.query_selector_all("tr")
             print(f"[BPIQ] 找到 {len(rows)} 行", flush=True)
 
-            # 第一遍：过滤
             candidates = []
 
             for row in rows:
@@ -464,19 +508,27 @@ async def scrape_bpiq_catalysts(exclude_tickers: set) -> List[Dict]:
                     company_text = (await cells[0].inner_text()).strip()
                     ticker = company_text.split()[0] if company_text else ""
 
-                    if not ticker or ticker in exclude_tickers:
+                    # 新增：过滤无效 ticker
+                    if not ticker or ticker == "N/A" or len(ticker) > 4 or ticker in exclude_tickers:
                         continue
 
                     company_link = ""
                     a_tag = await cells[0].query_selector("a")
-
                     if a_tag:
                         href = await a_tag.get_attribute("href")
                         if href:
                             company_link = href if href.startswith("http") else f"https://app.bpiq.com{href}"
 
-                    drug_en = re.sub(r"\s+", " ", (await cells[2].inner_text()).strip())
-                    stage_en = re.sub(r"\s+", " ", (await cells[3].inner_text()).strip())
+                    # 抓取后立刻清洗废话
+                    drug_en = clean_scraped_cell(
+                        re.sub(r"\s+", " ", (await cells[2].inner_text()).strip())
+                    )
+                    stage_en = clean_scraped_cell(
+                        re.sub(r"\s+", " ", (await cells[3].inner_text()).strip())
+                    )
+
+                    if not drug_en:
+                        continue
 
                     date_cell = cells[4]
                     full_text = (await date_cell.inner_text()).strip()
@@ -495,7 +547,6 @@ async def scrape_bpiq_catalysts(exclude_tickers: set) -> List[Dict]:
 
                     date_raw = date_match.group(1)
                     parsed = parse_catalyst_date(date_raw)
-
                     if not parsed:
                         continue
 
@@ -505,24 +556,20 @@ async def scrape_bpiq_catalysts(exclude_tickers: set) -> List[Dict]:
                         continue
 
                     dedup_key = f"{ticker}|{original_str}"
-
                     if dedup_key in bpiq_sent:
                         continue
 
                     source_link = company_link
                     links = await date_cell.query_selector_all("a")
-
                     for link in links:
                         href = await link.get_attribute("href")
                         text = ((await link.inner_text()) or "").lower()
-
                         if href and (
                             "view source" in text
                             or any(x in href for x in ["globenewswire", "prnewswire", "sec.gov", "businesswire"])
                         ):
                             source_link = href
                             break
-
                         if href and href.startswith("http") and not source_link:
                             source_link = href
 
@@ -540,14 +587,15 @@ async def scrape_bpiq_catalysts(exclude_tickers: set) -> List[Dict]:
 
             print(f"[BPIQ] 日期过滤后剩余 {len(candidates)} 条，开始翻译（非AI）...", flush=True)
 
-            # 第二遍：翻译并生成标题
             for c in candidates:
                 drug_zh = translate_bpiq_text(c["drug_en"])
                 stage_en = clean_stage_event(c["stage_en"])
-
-                # Drug & Indication 中文 + Stage & Event 英文
-                # 两者之间不加空格
                 title = f"{drug_zh}{stage_en}".strip()
+
+                # 翻译后仍含废话则丢弃
+                if is_junk_title(title):
+                    print(f"[BPIQ] 跳过废话标题: {c['ticker']} | {title[:80]}...", flush=True)
+                    continue
 
                 items.append({
                     "ticker": c["ticker"],
@@ -586,16 +634,12 @@ def push_combined(items: List[Dict], bpiq_keys: List[str]):
 
     for i, item in enumerate(items, 1):
         item_str = f"{i}. 🚀股票代码: ${item['ticker']}\n"
-
-        # 只保留公布时间，删除新闻时间
         if item.get("event_time"):
             item_str += f"   ⏰公布时间: {item['event_time']}\n"
-
         item_str += f"   📰内容标题: {item['title']}\n"
         item_str += f"   🔗<a href='{item['link']}'>点击查看公告</a>\n"
-
         if i < len(items):
-            item_str += " \n"
+            item_str += "--------------------------------\n"
 
         if len(full_msg) + len(item_str) + len(footer) > 3900:
             send_telegram(full_msg + footer)
@@ -622,7 +666,6 @@ def parse_rss_event_date(event_time: str) -> Optional[date]:
 
     text = str(event_time).strip()
 
-    # 2026年10月15日
     m = re.search(r"(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", text)
     if m:
         y, mo, d = map(int, m.groups())
@@ -631,7 +674,6 @@ def parse_rss_event_date(event_time: str) -> Optional[date]:
         except ValueError:
             return None
 
-    # 2026年10月（无日 → 当月最后一天，通常会超出3天窗口被滤掉）
     m = re.search(r"(20\d{2})\s*年\s*(\d{1,2})\s*月", text)
     if m:
         y, mo = map(int, m.groups())
@@ -642,7 +684,6 @@ def parse_rss_event_date(event_time: str) -> Optional[date]:
         except ValueError:
             return None
 
-    # October 15, 2026 / Oct 15, 2026
     m = re.search(
         r"(January|February|March|April|May|June|July|August|September|October|November|December|"
         r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),?\s+(20\d{2})",
@@ -658,7 +699,6 @@ def parse_rss_event_date(event_time: str) -> Optional[date]:
             except ValueError:
                 return None
 
-    # 2026-10-15
     m = re.search(r"(20\d{2})-(\d{1,2})-(\d{1,2})", text)
     if m:
         y, mo, d = map(int, m.groups())
@@ -674,7 +714,6 @@ def run_monitor():
     current_utc_ts = time.time()
     cutoff_ts = current_utc_ts - (HOURS_WINDOW * 3600)
 
-    # StockTitan：公布时间只保留今天起最多 3 天内
     rss_event_start = date.today()
     rss_event_end = date.today() + timedelta(days=3)
 
@@ -716,13 +755,17 @@ def run_monitor():
                 ticker_match = re.search(r"\|\s*([A-Z]+)\s+Stock News", title)
                 ticker = ticker_match.group(1) if ticker_match else "N/A"
 
+                # 新增：过滤无效 ticker
+                if ticker == "N/A" or len(ticker) > 4:
+                    print(f"[RSS] 跳过无效 ticker: {ticker}", flush=True)
+                    continue
+
                 english_title = clean_title(title)
                 chinese_title = translate_title(english_title)
 
                 body_text = get_article_body(entry.link)
                 event_time = analyze_event_time(english_title, body_text) if body_text else None
 
-                # 必须有可解析的公布时间，且落在今天～今天+3天
                 event_date = parse_rss_event_date(event_time) if event_time else None
                 if event_date is None:
                     print(f"[RSS] 跳过（无明确近日期）: {ticker} | {event_time}", flush=True)
@@ -743,7 +786,7 @@ def run_monitor():
                 })
                 new_urls.append(entry.link)
 
-    # ---- 2. BPIQ（逻辑不变） ----
+    # ---- 2. BPIQ ----
     bpiq_keys = []
 
     if ENABLE_BPIQ:
