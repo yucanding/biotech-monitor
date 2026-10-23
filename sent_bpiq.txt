@@ -81,3 +81,4 @@ BHVN|October 23, 2026
 CATX|October 23, 2026
 TGTX|October 23, 2026
 CELC|October 23, 2026
+KYTX|October 23, 2026
