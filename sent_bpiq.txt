@@ -82,3 +82,13 @@ CATX|October 23, 2026
 TGTX|October 23, 2026
 CELC|October 23, 2026
 KYTX|October 23, 2026
+ORIC|October 26, 2026
+AGEN|October 26, 2026
+IDYA|October 26, 2026
+ORIC|October 26, 2026
+IOVA|October 26, 2026
+EIKN|October 26, 2026
+CGEM|October 26, 2026
+CGEM|October 26, 2026
+SMMT|October 26, 2026
+TIL|October 26, 2026
