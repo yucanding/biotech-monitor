@@ -637,7 +637,7 @@ def push_combined(items: List[Dict], bpiq_keys: List[str]):
         if item.get("event_time"):
             item_str += f"   ⏰公布时间: {item['event_time']}\n"
         item_str += f"   📰内容标题: {item['title']}\n"
-        item_str += f"   🔗<a href='{item['link']}'>点击查看公告</a>\n"
+        item_str += f"   🔗<a href='{item['link']}'>点击查看公告</a>\n\n"
 
         if len(full_msg) + len(item_str) + len(footer) > 3900:
             send_telegram(full_msg + footer)
