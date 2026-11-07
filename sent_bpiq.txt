@@ -117,3 +117,11 @@ ASMB|November 7, 2026
 MCRB|November 7, 2026
 ARWR|November 7, 2026
 ASMB|November 7, 2026
+VIR|November 8, 2026
+NKTX|November 8, 2026
+DTIL|November 8, 2026
+CGEM|November 8, 2026
+CRSP|November 8, 2026
+GILD|November 8, 2026
+GILD|November 8, 2026
+LLY|November 8, 2026
