@@ -125,3 +125,9 @@ CRSP|November 8, 2026
 GILD|November 8, 2026
 GILD|November 8, 2026
 LLY|November 8, 2026
+NTLA|November 9, 2026
+CRSP|November 9, 2026
+ALLO|November 9, 2026
+XNCR|November 9, 2026
+JANX|November 9, 2026
+AUTL|November 10, 2026
