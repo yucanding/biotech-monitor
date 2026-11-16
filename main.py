@@ -675,8 +675,26 @@ def make_rttnews_dedup_key(ticker: str, title_en: str, start_date: date, end_dat
         start_date.isoformat(), end_date.isoformat(),
     ])
 
-def parse_rttnews_page(html: str, page_url: str, window_start: date, window_end: date) -> List[Dict]:
-    """解析一页 HTML，返回窗口内且 Pending 的原始条目（英文标题，未翻译）。"""
+# NYSE 休市日（2026–2027），用于算每月最后一个交易日；超出此范围的年份退化为最后一个工作日。
+US_MARKET_HOLIDAYS = {
+    date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16), date(2026, 4, 3),
+    date(2026, 5, 25), date(2026, 6, 19), date(2026, 7, 3), date(2026, 9, 7),
+    date(2026, 11, 26), date(2026, 12, 25),
+    date(2027, 1, 1), date(2027, 1, 18), date(2027, 2, 15), date(2027, 3, 26),
+    date(2027, 5, 31), date(2027, 6, 18), date(2027, 7, 5), date(2027, 9, 6),
+    date(2027, 11, 25), date(2027, 12, 24),
+}
+
+def last_trading_day_of_month(year: int, month: int) -> date:
+    """该月最后一个交易日：从月末往前找，跳过周末与 NYSE 休市日。"""
+    d = date(year, month, calendar.monthrange(year, month)[1])
+    while d.weekday() >= 5 or d in US_MARKET_HOLIDAYS:
+        d -= timedelta(days=1)
+    return d
+
+def parse_rttnews_page(html: str, page_url: str, window_start: date, window_end: date, today: date) -> List[Dict]:
+    """解析一页 HTML，返回窗口内且 Pending 的原始条目（英文标题，未翻译）。
+    仅到月的条目（如 Nov 2026）只有在 today 为该月最后一个交易日时才返回。"""
     soup = BeautifulSoup(html, "html.parser")
     rows = []
     for row in soup.find_all("div", class_="grid-row"):
@@ -699,11 +717,11 @@ def parse_rttnews_page(html: str, page_url: str, window_start: date, window_end:
             continue
         d, month_only = parsed
         if month_only:
-            # 仅到月的看该月是否与窗口有交集
+            # 仅到月的条目：只有到了该月最后一个交易日才推，平时一律不推
+            if today != last_trading_day_of_month(d.year, d.month):
+                continue
             last_day = calendar.monthrange(d.year, d.month)[1]
             date_start, date_end = d, date(d.year, d.month, last_day)
-            if date_end < window_start or date_start > window_end:
-                continue
         else:
             date_start = date_end = d
             if not (window_start <= d <= window_end):
@@ -740,7 +758,7 @@ def scrape_rttnews_catalysts() -> List[Dict]:
         except requests.RequestException as e:
             print(f"[RTTNews] 抓取失败 {url}: {e}", flush=True)
             continue
-        for row in parse_rttnews_page(resp.text, url, window_start, window_end):
+        for row in parse_rttnews_page(resp.text, url, window_start, window_end, today):
             dedup_key = make_rttnews_dedup_key(row["ticker"], row["title_en"], row["_date_start"], row["_date_end"])
             if dedup_key in sent:
                 continue
@@ -918,8 +936,8 @@ def run_monitor():
                     cross_duplicates += 1
                     print(f"[CROSS-DEDUP] 跳过重复事件: {item['ticker']} | {item['title_en']} | {item['event_time']}", flush=True)
                     continue
-                # 跨源去重通过后再翻译，省掉重复条目的 Gemini 调用
-                item["title"] = translate_title(item["title_en"])
+                # 跨源去重通过后再翻译，省掉重复条目的 Gemini 调用；RTT 标题后统一跟 PDUFA
+                item["title"] = (translate_title(item["title_en"]) + " PDUFA").strip()
                 collected_items.append(item)
                 rttnews_keys.append(item["dedup_key"])
             print(f"[CROSS-DEDUP] RTTNews 跨源去重: {cross_duplicates} 条，保留 {len(rttnews_keys)} 条", flush=True)
