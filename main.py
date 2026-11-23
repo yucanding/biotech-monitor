@@ -825,7 +825,7 @@ def push_combined(items: List[Dict], bpiq_keys: List[str], rttnews_keys: Optiona
         return False
     now_et = datetime.now(ZoneInfo("America/New_York"))
     header = f"🚨<b>{now_et.month}月{now_et.day}日医药股数据发布预警（共{len(items)}条）</b>\n\n"
-    footer = "\n#ClinicalData"
+    footer = "#ClinicalData"
     messages = []
     current_msg = header
     for i, item in enumerate(items, 1):
