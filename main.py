@@ -512,7 +512,23 @@ async def scrape_bpiq_catalysts() -> List[Dict]:
             await asyncio.sleep(3)
             rows = await page.query_selector_all("table tbody tr") or await page.query_selector_all("tr")
             print(f"[BPIQ] 找到 {len(rows)} 行", flush=True)
+            _tables = await page.query_selector_all("table")
+            print(f"[BPIQ] 表格数 {len(_tables)}", flush=True)
+            for _ti, _t in enumerate(_tables):
+                _trs = await _t.query_selector_all("tbody tr")
+                print(f"[BPIQ] 表{_ti}: tbody 行 {len(_trs)}", flush=True)
+            print(f"[BPIQ] sent_bpiq.txt 已有 {len(bpiq_sent)} 条", flush=True)
+            for _r in rows[:5]:
+                try:
+                    _cs = await _r.query_selector_all("td")
+                    _texts = []
+                    for _c in _cs:
+                        _texts.append((await _c.inner_text()).strip().replace("\n", " ")[:100])
+                    print(f"[BPIQ] 行样例 cells={len(_cs)}: {' || '.join(_texts)}", flush=True)
+                except Exception as _e:
+                    print(f"[BPIQ] 行样例读取失败: {_e}", flush=True)
             candidates = []
+            _drop = {"cells<5": 0, "ticker": 0, "drug空": 0, "无日期匹配": 0, "解析失败": 0, "窗口外": 0, "去重": 0}
             month_pattern = (
                 r"(?:January|February|March|April|May|June|July|August|September|October|November|December|"
                 r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
@@ -526,10 +542,12 @@ async def scrape_bpiq_catalysts() -> List[Dict]:
                 try:
                     cells = await row.query_selector_all("td")
                     if len(cells) < 5:
+                        _drop["cells<5"] += 1
                         continue
                     company_text = (await cells[0].inner_text()).strip()
                     ticker = company_text.split()[0] if company_text else ""
                     if not ticker or ticker == "N/A" or len(ticker) > 4:
+                        _drop["ticker"] += 1
                         continue
                     company_link = ""
                     a_tag = await cells[0].query_selector("a")
@@ -540,22 +558,27 @@ async def scrape_bpiq_catalysts() -> List[Dict]:
                     drug_en = clean_scraped_cell(re.sub(r"\s+", " ", (await cells[2].inner_text()).strip()))
                     stage_en = clean_scraped_cell(re.sub(r"\s+", " ", (await cells[3].inner_text()).strip()))
                     if not drug_en:
+                        _drop["drug空"] += 1
                         continue
                     date_cell = cells[4]
                     full_text = (await date_cell.inner_text()).strip()
                     date_match = re.search(date_pattern, full_text, re.I)
                     if not date_match:
+                        _drop["无日期匹配"] += 1
                         continue
                     date_raw = date_match.group(1)
                     parsed = parse_catalyst_date_range(date_raw)
                     if not parsed:
+                        _drop["解析失败"] += 1
                         continue
                     date_start, date_end, date_zh = parsed
                     if date_end < start_date or date_start > end_date:
+                        _drop["窗口外"] += 1
                         continue
                     dedup_key = make_bpiq_dedup_key(ticker, drug_en, stage_en, date_start, date_end)
                     legacy_key = f"{ticker}|{date_raw}"
                     if dedup_key in bpiq_sent or legacy_key in bpiq_sent:
+                        _drop["去重"] += 1
                         continue
                     source_link = company_link
                     links = await date_cell.query_selector_all("a")
@@ -575,6 +598,7 @@ async def scrape_bpiq_catalysts() -> List[Dict]:
                     })
                 except Exception:
                     continue
+            print(f"[BPIQ] 丢弃统计: {_drop}", flush=True)
             print(f"[BPIQ] 日期过滤后剩余 {len(candidates)} 条，开始翻译（非AI）...", flush=True)
             for c in candidates:
                 drug_zh = translate_bpiq_text(c["drug_en"])
