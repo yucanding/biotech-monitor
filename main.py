@@ -480,7 +480,6 @@ async def scrape_bpiq_catalysts(exclude_tickers: set = None) -> List[Dict]:
     bpiq_sent = read_set(BPIQ_SENT_DB_FILE)
     browser = None
 
-    # 更宽松的日期匹配（优先精确日期）
     DATE_PATTERN = re.compile(
         r"(?P<date>"
         r"(?:January|February|March|April|May|June|July|August|September|October|November|December|"
@@ -532,7 +531,7 @@ async def scrape_bpiq_catalysts(exclude_tickers: set = None) -> List[Dict]:
             for row in rows:
                 try:
                     cells = await row.query_selector_all("td")
-                    if len(cells) < 4:
+                    if len(cells) < 5:
                         continue
 
                     company_text = (await cells[0].inner_text()).strip()
@@ -547,43 +546,21 @@ async def scrape_bpiq_catalysts(exclude_tickers: set = None) -> List[Dict]:
                         if href:
                             company_link = href if href.startswith("http") else f"https://app.bpiq.com{href}"
 
-                    # 尝试从多个可能位置取 drug / stage
-                    drug_en = ""
-                    stage_en = ""
-                    date_text = ""
-
-                    # 常见列顺序尝试
-                    for idx, cell in enumerate(cells):
-                        txt = (await cell.inner_text()).strip()
-                        txt_clean = clean_scraped_cell(re.sub(r"\s+", " ", txt))
-                        if not txt_clean:
-                            continue
-
-                        # 优先找带日期的单元格
-                        if DATE_PATTERN.search(txt) and not date_text:
-                            date_text = txt
-
-                        # drug 通常较长且含药名特征
-                        if len(txt_clean) > 8 and not drug_en and idx >= 1:
-                            # 简单启发式：包含括号或常见药名后缀的更可能是 drug
-                            if re.search(r"\(|phase|data|readout|trial|alfa|mab|nib|ib", txt_clean, re.I) or idx == 2:
-                                drug_en = txt_clean
-
-                    # 兜底
-                    if not drug_en and len(cells) > 2:
-                        drug_en = clean_scraped_cell(re.sub(r"\s+", " ", (await cells[2].inner_text()).strip()))
-                    if not stage_en and len(cells) > 3:
-                        stage_en = clean_scraped_cell(re.sub(r"\s+", " ", (await cells[3].inner_text()).strip()))
-                    if not date_text and len(cells) > 4:
-                        date_text = (await cells[4].inner_text()).strip()
+                    # 恢复原来可靠的列索引
+                    drug_en = clean_scraped_cell(re.sub(r"\s+", " ", (await cells[2].inner_text()).strip()))
+                    stage_en = clean_scraped_cell(re.sub(r"\s+", " ", (await cells[3].inner_text()).strip()))
 
                     if not drug_en:
                         continue
 
-                    # 提取日期（优先精确日期）
+                    # 日期单元格
+                    date_cell = cells[4]
+                    date_text = (await date_cell.inner_text()).strip()
+
+                    # 提取日期（增强版，兼容后面带大量 notes 的情况）
                     date_match = DATE_PATTERN.search(date_text)
                     if not date_match:
-                        # 整行再搜一次
+                        # 整行再搜一次兜底
                         row_text = (await row.inner_text()).strip()
                         date_match = DATE_PATTERN.search(row_text)
                     if not date_match:
@@ -605,21 +582,20 @@ async def scrape_bpiq_catalysts(exclude_tickers: set = None) -> List[Dict]:
 
                     # 找 source link
                     source_link = company_link
-                    for cell in cells:
-                        links = await cell.query_selector_all("a")
-                        for link in links:
-                            href = await link.get_attribute("href")
-                            link_text = ((await link.inner_text()) or "").lower()
-                            if href and ("view source" in link_text or any(d in href for d in ["globenewswire", "prnewswire", "sec.gov", "businesswire"])):
-                                source_link = href
-                                break
-                        if source_link != company_link:
+                    links = await date_cell.query_selector_all("a")
+                    for link in links:
+                        href = await link.get_attribute("href")
+                        link_text = ((await link.inner_text()) or "").lower()
+                        if href and ("view source" in link_text or any(d in href for d in ["globenewswire", "prnewswire", "sec.gov", "businesswire"])):
+                            source_link = href
                             break
+                        if href and href.startswith("http") and not source_link:
+                            source_link = href
 
                     candidates.append({
                         "ticker": ticker,
                         "drug_en": drug_en,
-                        "stage_en": stage_en or "",
+                        "stage_en": stage_en,
                         "date_raw": original_str,
                         "compare_date": compare_date,
                         "link": source_link or company_link or "https://app.bpiq.com/catalyst-calendar",
@@ -634,7 +610,7 @@ async def scrape_bpiq_catalysts(exclude_tickers: set = None) -> List[Dict]:
             for c in candidates:
                 drug_zh = translate_bpiq_text(c["drug_en"])
                 stage_en = clean_stage_event(c["stage_en"])
-                title = f"{drug_zh}{stage_en}".strip()
+                title = f"{drug_zh} {stage_en}".strip()   # 加个空格更清晰
                 if is_junk_title(title):
                     print(f"[BPIQ] 跳过废话标题: {c['ticker']} | {title[:80]}...", flush=True)
                     continue
@@ -665,7 +641,7 @@ async def scrape_bpiq_catalysts(exclude_tickers: set = None) -> List[Dict]:
         kill_browser_processes()
 
     return items
-
+    
 # ==================== RTTNews FDA Calendar ====================
 RTTNEWS_DATE_RE = re.compile(r"^\s*(\d{1,2}/\d{1,2}/\d{4})")
 RTTNEWS_MONTH_RE = re.compile(r"^\s*([A-Za-z]{3,9})\s+(\d{4})")
