@@ -365,7 +365,7 @@ def clean_stage_event(text: str) -> str:
     text = re.sub(r"\s*[-–—,:;/|&]+\s*$", "", text)
     return text.strip()
 
-# ==================== BPIQ 日期解析（原来能用的版本） ====================
+# ==================== BPIQ 日期解析 ====================
 def _month_to_num(name: str) -> Optional[int]:
     mapping = {
         "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
@@ -376,18 +376,16 @@ def _month_to_num(name: str) -> Optional[int]:
     return mapping.get(name.lower())
 
 def parse_catalyst_date(date_str: str) -> Optional[Tuple[str, date]]:
-    """原来能用的解析：返回 (原始字符串, 用于过滤的 compare_date)。
-    月份/季度等宽范围取区间终点。"""
     if not date_str or not date_str.strip():
         return None
 
-    original = date_str.strip()
+    original = re.sub(r"\s+", " ", date_str.strip())
 
-    # 精确日期（且不是范围）
+    # 精确日期（优先）
     m = re.search(
-        r"(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),?\s+(\d{4})",
-        original,
-        re.I,
+        r"(January|February|March|April|May|June|July|August|September|October|November|December|"
+        r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),?\s+(\d{4})",
+        original, re.I,
     )
     if m and not re.search(r"\d{1,2}\s*-\s*\d{1,2}", original):
         month_name, day, year = m.groups()
@@ -398,11 +396,11 @@ def parse_catalyst_date(date_str: str) -> Optional[Tuple[str, date]]:
             except ValueError:
                 pass
 
-    # 同月日期范围，取结束日
+    # 同月范围，取结束日
     m = re.search(
-        r"(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s*-\s*(\d{1,2}),?\s+(\d{4})",
-        original,
-        re.I,
+        r"(January|February|March|April|May|June|July|August|September|October|November|December|"
+        r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s*-\s*(\d{1,2}),?\s+(\d{4})",
+        original, re.I,
     )
     if m:
         month_name, _, day2, year = m.groups()
@@ -413,11 +411,11 @@ def parse_catalyst_date(date_str: str) -> Optional[Tuple[str, date]]:
             except ValueError:
                 pass
 
-    # 仅月份 → 取该月最后一天
+    # 仅月份 → 月末
     m = re.search(
-        r"(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})",
-        original,
-        re.I,
+        r"(January|February|March|April|May|June|July|August|September|October|November|December|"
+        r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})",
+        original, re.I,
     )
     if m:
         month_name, year = m.groups()
@@ -429,7 +427,7 @@ def parse_catalyst_date(date_str: str) -> Optional[Tuple[str, date]]:
                 d = date(int(year), month + 1, 1) - timedelta(days=1)
             return original, d
 
-    # 季度 → 取季度最后一天
+    # 季度 → 季度末
     m = re.search(r"Q([1-4])\s*'?(\d{2,4})", original, re.I)
     if m:
         q, y = m.groups()
@@ -451,7 +449,6 @@ def parse_catalyst_date(date_str: str) -> Optional[Tuple[str, date]]:
         month, day = mapping.get(season, (12, 31))
         return original, date(year, month, day)
 
-    # 兜底：只有年份
     m = re.search(r"\b(20\d{2})\b", original)
     if m:
         return original, date(int(m.group(1)), 12, 31)
@@ -463,7 +460,7 @@ def normalize_event_text(text: str) -> str:
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
-# ==================== BPIQ 抓取（原来能用的版本） ====================
+# ==================== BPIQ 抓取（增强日期提取） ====================
 async def scrape_bpiq_catalysts(exclude_tickers: set = None) -> List[Dict]:
     if exclude_tickers is None:
         exclude_tickers = set()
@@ -483,15 +480,27 @@ async def scrape_bpiq_catalysts(exclude_tickers: set = None) -> List[Dict]:
     bpiq_sent = read_set(BPIQ_SENT_DB_FILE)
     browser = None
 
+    # 更宽松的日期匹配（优先精确日期）
+    DATE_PATTERN = re.compile(
+        r"(?P<date>"
+        r"(?:January|February|March|April|May|June|July|August|September|October|November|December|"
+        r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}(?:\s*-\s*\d{1,2})?,?\s+\d{4}"
+        r"|"
+        r"(?:January|February|March|April|May|June|July|August|September|October|November|December|"
+        r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}"
+        r"|"
+        r"Q[1-4]\s*'?\d{2,4}"
+        r"|"
+        r"(?:Summer|Mid|Late|Early|H[12])\s+\d{4}"
+        r")",
+        re.I,
+    )
+
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ],
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
             )
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 720},
@@ -501,11 +510,7 @@ async def scrape_bpiq_catalysts(exclude_tickers: set = None) -> List[Dict]:
             print("[BPIQ] 打开页面...", flush=True)
 
             try:
-                await page.goto(
-                    "https://app.bpiq.com/catalyst-calendar",
-                    wait_until="domcontentloaded",
-                    timeout=45000,
-                )
+                await page.goto("https://app.bpiq.com/catalyst-calendar", wait_until="domcontentloaded", timeout=45000)
             except Exception as e:
                 print(f"[BPIQ] 页面加载失败: {e}", flush=True)
                 return []
@@ -527,13 +532,12 @@ async def scrape_bpiq_catalysts(exclude_tickers: set = None) -> List[Dict]:
             for row in rows:
                 try:
                     cells = await row.query_selector_all("td")
-                    if len(cells) < 5:
+                    if len(cells) < 4:
                         continue
 
                     company_text = (await cells[0].inner_text()).strip()
                     ticker = company_text.split()[0] if company_text else ""
-
-                    if not ticker or ticker == "N/A" or len(ticker) > 4 or ticker in exclude_tickers:
+                    if not ticker or ticker == "N/A" or len(ticker) > 5 or ticker in exclude_tickers:
                         continue
 
                     company_link = ""
@@ -543,39 +547,55 @@ async def scrape_bpiq_catalysts(exclude_tickers: set = None) -> List[Dict]:
                         if href:
                             company_link = href if href.startswith("http") else f"https://app.bpiq.com{href}"
 
-                    drug_en = clean_scraped_cell(
-                        re.sub(r"\s+", " ", (await cells[2].inner_text()).strip())
-                    )
-                    stage_en = clean_scraped_cell(
-                        re.sub(r"\s+", " ", (await cells[3].inner_text()).strip())
-                    )
+                    # 尝试从多个可能位置取 drug / stage
+                    drug_en = ""
+                    stage_en = ""
+                    date_text = ""
+
+                    # 常见列顺序尝试
+                    for idx, cell in enumerate(cells):
+                        txt = (await cell.inner_text()).strip()
+                        txt_clean = clean_scraped_cell(re.sub(r"\s+", " ", txt))
+                        if not txt_clean:
+                            continue
+
+                        # 优先找带日期的单元格
+                        if DATE_PATTERN.search(txt) and not date_text:
+                            date_text = txt
+
+                        # drug 通常较长且含药名特征
+                        if len(txt_clean) > 8 and not drug_en and idx >= 1:
+                            # 简单启发式：包含括号或常见药名后缀的更可能是 drug
+                            if re.search(r"\(|phase|data|readout|trial|alfa|mab|nib|ib", txt_clean, re.I) or idx == 2:
+                                drug_en = txt_clean
+
+                    # 兜底
+                    if not drug_en and len(cells) > 2:
+                        drug_en = clean_scraped_cell(re.sub(r"\s+", " ", (await cells[2].inner_text()).strip()))
+                    if not stage_en and len(cells) > 3:
+                        stage_en = clean_scraped_cell(re.sub(r"\s+", " ", (await cells[3].inner_text()).strip()))
+                    if not date_text and len(cells) > 4:
+                        date_text = (await cells[4].inner_text()).strip()
 
                     if not drug_en:
                         continue
 
-                    date_cell = cells[4]
-                    full_text = (await date_cell.inner_text()).strip()
-
-                    date_match = re.search(
-                        r"((?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}(?:\s*-\s*\d{1,2})?,?\s+\d{4}|"
-                        r"(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}|"
-                        r"Q[1-4]\s*'?\d{2,4}|"
-                        r"(?:Summer|Mid|Late|Early|H[12])\s+\d{4})",
-                        full_text,
-                        re.I,
-                    )
-
+                    # 提取日期（优先精确日期）
+                    date_match = DATE_PATTERN.search(date_text)
+                    if not date_match:
+                        # 整行再搜一次
+                        row_text = (await row.inner_text()).strip()
+                        date_match = DATE_PATTERN.search(row_text)
                     if not date_match:
                         continue
 
-                    date_raw = date_match.group(1)
+                    date_raw = date_match.group("date").strip()
                     parsed = parse_catalyst_date(date_raw)
                     if not parsed:
                         continue
 
                     original_str, compare_date = parsed
 
-                    # 关键过滤：compare_date 必须落在窗口内
                     if not (start_date <= compare_date <= end_date):
                         continue
 
@@ -583,24 +603,23 @@ async def scrape_bpiq_catalysts(exclude_tickers: set = None) -> List[Dict]:
                     if dedup_key in bpiq_sent:
                         continue
 
+                    # 找 source link
                     source_link = company_link
-                    links = await date_cell.query_selector_all("a")
-                    for link in links:
-                        href = await link.get_attribute("href")
-                        text = ((await link.inner_text()) or "").lower()
-                        if href and (
-                            "view source" in text
-                            or any(x in href for x in ["globenewswire", "prnewswire", "sec.gov", "businesswire"])
-                        ):
-                            source_link = href
+                    for cell in cells:
+                        links = await cell.query_selector_all("a")
+                        for link in links:
+                            href = await link.get_attribute("href")
+                            link_text = ((await link.inner_text()) or "").lower()
+                            if href and ("view source" in link_text or any(d in href for d in ["globenewswire", "prnewswire", "sec.gov", "businesswire"])):
+                                source_link = href
+                                break
+                        if source_link != company_link:
                             break
-                        if href and href.startswith("http") and not source_link:
-                            source_link = href
 
                     candidates.append({
                         "ticker": ticker,
                         "drug_en": drug_en,
-                        "stage_en": stage_en,
+                        "stage_en": stage_en or "",
                         "date_raw": original_str,
                         "compare_date": compare_date,
                         "link": source_link or company_link or "https://app.bpiq.com/catalyst-calendar",
@@ -616,15 +635,13 @@ async def scrape_bpiq_catalysts(exclude_tickers: set = None) -> List[Dict]:
                 drug_zh = translate_bpiq_text(c["drug_en"])
                 stage_en = clean_stage_event(c["stage_en"])
                 title = f"{drug_zh}{stage_en}".strip()
-
                 if is_junk_title(title):
                     print(f"[BPIQ] 跳过废话标题: {c['ticker']} | {title[:80]}...", flush=True)
                     continue
 
-                # 补齐跨源去重需要的字段
                 items.append({
                     "ticker": c["ticker"],
-                    "event_time": c["date_raw"],          # 保留原始英文日期字符串
+                    "event_time": c["date_raw"],
                     "title": title,
                     "link": c["link"],
                     "dedup_key": c["dedup_key"],
@@ -639,7 +656,6 @@ async def scrape_bpiq_catalysts(exclude_tickers: set = None) -> List[Dict]:
     except Exception as e:
         print(f"[BPIQ] 异常: {e}", flush=True)
         return []
-
     finally:
         try:
             if browser:
@@ -707,10 +723,13 @@ def format_rttnews_event_time(d: date, month_only: bool) -> str:
     return f"{d.year}年{d.month}月{d.day}日"
 
 def make_rttnews_dedup_key(ticker: str, title_en: str, start_date: date, end_date: date) -> str:
-    return "|".join([
-        ticker.upper().strip(), normalize_event_text(title_en),
-        start_date.isoformat(), end_date.isoformat(),
-    ])
+    """更稳定的去重 key：ticker + 日期 + 核心关键词（避免标题微小变化导致重复推送）"""
+    core = normalize_event_text(title_en)
+    # 去掉常见停用词，只保留前几个有意义的词
+    stop = {"the", "and", "for", "of", "in", "to", "a", "an", "on", "with", "by", "from", "fda", "decision", "approval"}
+    tokens = [t for t in core.split() if len(t) > 2 and t not in stop][:5]
+    short = " ".join(tokens) if tokens else "event"
+    return f"{ticker.upper().strip()}|{start_date.isoformat()}|{short}"
 
 US_MARKET_HOLIDAYS = {
     date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16), date(2026, 4, 3),
@@ -929,7 +948,7 @@ def run_monitor():
             new_urls.append(entry.link)
     print(f"[RSS] 本轮收集 {len(collected_items)} 条，涉及 ticker: {sorted(rss_tickers)}", flush=True)
 
-    # ---- 2. BPIQ（使用原来能用的抓取方式） ----
+    # ---- 2. BPIQ ----
     bpiq_keys = []
     if ENABLE_BPIQ:
         print("\n[BPIQ] 开始抓取...", flush=True)
