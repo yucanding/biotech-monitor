@@ -514,8 +514,8 @@ async def scrape_bpiq_catalysts() -> List[Dict]:
             print(f"[BPIQ] 找到 {len(rows)} 行", flush=True)
             candidates = []
             month_pattern = (
-                r"January|February|March|April|May|June|July|August|September|October|November|December|"
-                r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec"
+                r"(?:January|February|March|April|May|June|July|August|September|October|November|December|"
+                r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
             )
             date_pattern = (
                 rf"({month_pattern}\s+\d{{1,2}}\s*-\s*(?:(?:{month_pattern})\s+)?\d{{1,2}},?\s+\d{{4}}|"
