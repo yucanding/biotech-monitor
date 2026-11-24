@@ -142,4 +142,3 @@ NTLA|November 13, 2026
 BTAI|November 14, 2026
 CRBP|November 15, 2026
 BCRX|November 15, 2026
-DMAC|November 24, 2026
