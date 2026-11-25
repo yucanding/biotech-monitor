@@ -174,31 +174,30 @@ def gemini_text(prompt: str, max_tokens: int = 300) -> str:
 
 # ==================== Telegram ====================
 def send_telegram(message: str) -> bool:
+    """至少有一个目标发送成功即视为成功（避免某个目标长期失败导致去重库永不更新）。"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     if not TELEGRAM_TARGETS:
         print("未配置任何 Telegram 目标", flush=True)
         return False
-    all_success = True
+    any_success = False
     for chat_id in TELEGRAM_TARGETS:
         payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
         try:
             r = requests.post(url, json=payload, timeout=15)
             if r.status_code != 200:
-                all_success = False
                 print(f"发送到 {chat_id} 失败: {r.text}", flush=True)
                 continue
             try:
                 response_json = r.json()
-                if not response_json.get("ok", False):
-                    all_success = False
+                if response_json.get("ok", False):
+                    any_success = True
+                else:
                     print(f"发送到 {chat_id} 失败: {response_json}", flush=True)
             except Exception:
-                all_success = False
                 print(f"发送到 {chat_id} 返回无法解析的响应", flush=True)
         except Exception as e:
-            all_success = False
             print(f"发送到 {chat_id} 失败: {e}", flush=True)
-    return all_success
+    return any_success
 
 # ==================== StockTitan ====================
 def get_article_body(url: str) -> Optional[str]:
@@ -462,6 +461,11 @@ def normalize_event_text(text: str) -> str:
 
 # ==================== BPIQ 抓取（增强日期提取） ====================
 async def scrape_bpiq_catalysts(exclude_tickers: set = None) -> List[Dict]:
+    """
+    exclude_tickers 中的 ticker（StockTitan 已覆盖）不再直接丢弃，
+    而是返回带 _suppressed=True 的条目，由调用方把它们的 key 记入去重库，
+    这样下一轮不会再被当作"新条目"重新推送。
+    """
     if exclude_tickers is None:
         exclude_tickers = set()
 
@@ -536,7 +540,8 @@ async def scrape_bpiq_catalysts(exclude_tickers: set = None) -> List[Dict]:
 
                     company_text = (await cells[0].inner_text()).strip()
                     ticker = company_text.split()[0] if company_text else ""
-                    if not ticker or ticker == "N/A" or len(ticker) > 5 or ticker in exclude_tickers:
+                    # 注意：这里不再因 exclude_tickers 直接 continue
+                    if not ticker or ticker == "N/A" or len(ticker) > 5:
                         continue
 
                     company_link = ""
@@ -600,6 +605,7 @@ async def scrape_bpiq_catalysts(exclude_tickers: set = None) -> List[Dict]:
                         "compare_date": compare_date,
                         "link": source_link or company_link or "https://app.bpiq.com/catalyst-calendar",
                         "dedup_key": dedup_key,
+                        "suppressed": ticker in exclude_tickers,
                     })
 
                 except Exception:
@@ -608,6 +614,22 @@ async def scrape_bpiq_catalysts(exclude_tickers: set = None) -> List[Dict]:
             print(f"[BPIQ] 日期过滤后剩余 {len(candidates)} 条，开始翻译（非AI）...", flush=True)
 
             for c in candidates:
+                # 已被 StockTitan 覆盖的：不翻译、不推送，只返回 key 供记录
+                if c["suppressed"]:
+                    items.append({
+                        "ticker": c["ticker"],
+                        "event_time": c["date_raw"],
+                        "title": "",
+                        "link": c["link"],
+                        "dedup_key": c["dedup_key"],
+                        "_source": "BPIQ",
+                        "_date_start": c["compare_date"],
+                        "_date_end": c["compare_date"],
+                        "_match_text": c["drug_en"],
+                        "_suppressed": True,
+                    })
+                    continue
+
                 drug_zh = translate_bpiq_text(c["drug_en"])
                 stage_en = clean_stage_event(c["stage_en"])
                 title = f"{drug_zh} {stage_en}".strip()   # 加个空格更清晰
@@ -627,7 +649,7 @@ async def scrape_bpiq_catalysts(exclude_tickers: set = None) -> List[Dict]:
                     "_match_text": c["drug_en"],
                 })
 
-            print(f"[BPIQ] 本轮最终 {len(items)} 条", flush=True)
+            print(f"[BPIQ] 本轮最终 {len(items)} 条（含已抑制）", flush=True)
 
     except Exception as e:
         print(f"[BPIQ] 异常: {e}", flush=True)
@@ -641,7 +663,7 @@ async def scrape_bpiq_catalysts(exclude_tickers: set = None) -> List[Dict]:
         kill_browser_processes()
 
     return items
-    
+
 # ==================== RTTNews FDA Calendar ====================
 RTTNEWS_DATE_RE = re.compile(r"^\s*(\d{1,2}/\d{1,2}/\d{4})")
 RTTNEWS_MONTH_RE = re.compile(r"^\s*([A-Za-z]{3,9})\s+(\d{4})")
@@ -699,13 +721,12 @@ def format_rttnews_event_time(d: date, month_only: bool) -> str:
     return f"{d.year}年{d.month}月{d.day}日"
 
 def make_rttnews_dedup_key(ticker: str, title_en: str, start_date: date, end_date: date) -> str:
-    """更稳定的去重 key：ticker + 日期 + 核心关键词（避免标题微小变化导致重复推送）"""
-    core = normalize_event_text(title_en)
-    # 去掉常见停用词，只保留前几个有意义的词
-    stop = {"the", "and", "for", "of", "in", "to", "a", "an", "on", "with", "by", "from", "fda", "decision", "approval"}
-    tokens = [t for t in core.split() if len(t) > 2 and t not in stop][:5]
-    short = " ".join(tokens) if tokens else "event"
-    return f"{ticker.upper().strip()}|{start_date.isoformat()}|{short}"
+    """
+    稳定的去重 key：ticker + 起止日期。
+    不再包含标题词，避免 RTTNews 页面标题措辞微调导致同一事件被重复推送。
+    （title_en 参数保留仅为兼容调用处。）
+    """
+    return f"{ticker.upper().strip()}|{start_date.isoformat()}|{end_date.isoformat()}"
 
 US_MARKET_HOLIDAYS = {
     date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16), date(2026, 4, 3),
@@ -774,7 +795,9 @@ def scrape_rttnews_catalysts() -> List[Dict]:
     window_end = today + timedelta(days=RTTNEWS_DAYS_AFTER)
     print(f"[RTTNews] 时间窗口：{window_start} ~ {window_end}", flush=True)
     sent = read_set(RTTNEWS_SENT_DB_FILE)
+    print(f"[RTTNews] 已读取去重记录 {len(sent)} 条", flush=True)
     items = []
+    seen_keys = set()  # 本轮内部去重（多页重复出现同一事件）
     for url in RTTNEWS_URLS:
         try:
             resp = requests.get(url, headers=RTTNEWS_HEADERS, timeout=30)
@@ -784,8 +807,9 @@ def scrape_rttnews_catalysts() -> List[Dict]:
             continue
         for row in parse_rttnews_page(resp.text, url, window_start, window_end, today):
             dedup_key = make_rttnews_dedup_key(row["ticker"], row["title_en"], row["_date_start"], row["_date_end"])
-            if dedup_key in sent:
+            if dedup_key in sent or dedup_key in seen_keys:
                 continue
+            seen_keys.add(dedup_key)
             row["dedup_key"] = dedup_key
             items.append(row)
     print(f"[RTTNews] 本轮新条目 {len(items)} 条（未翻译、未跨源去重）", flush=True)
@@ -925,7 +949,8 @@ def run_monitor():
     print(f"[RSS] 本轮收集 {len(collected_items)} 条，涉及 ticker: {sorted(rss_tickers)}", flush=True)
 
     # ---- 2. BPIQ ----
-    bpiq_keys = []
+    bpiq_keys = []          # 实际推送的
+    bpiq_suppressed = []    # 被抑制（已被其他源覆盖）的，只记录不推送
     if ENABLE_BPIQ:
         print("\n[BPIQ] 开始抓取...", flush=True)
         try:
@@ -937,13 +962,17 @@ def run_monitor():
             )
             cross_duplicates = 0
             for item in bpiq_items:
+                if item.get("_suppressed"):
+                    bpiq_suppressed.append(item["dedup_key"])
+                    continue
                 if is_cross_source_duplicate(item, collected_items):
                     cross_duplicates += 1
+                    bpiq_suppressed.append(item["dedup_key"])
                     print(f"[CROSS-DEDUP] 跳过重复事件: {item['ticker']} | {item['title']} | {item['event_time']}", flush=True)
                     continue
                 collected_items.append(item)
                 bpiq_keys.append(item["dedup_key"])
-            print(f"[CROSS-DEDUP] BPIQ 跨源去重: {cross_duplicates} 条，保留 {len(bpiq_keys)} 条", flush=True)
+            print(f"[CROSS-DEDUP] BPIQ 跨源去重: {cross_duplicates} 条，ticker 排除 {len(bpiq_suppressed) - cross_duplicates} 条，保留 {len(bpiq_keys)} 条", flush=True)
         except asyncio.TimeoutError:
             print("[BPIQ] 超时，跳过", flush=True)
         except Exception as e:
@@ -955,6 +984,7 @@ def run_monitor():
 
     # ---- 3. RTTNews ----
     rttnews_keys = []
+    rttnews_suppressed = []
     if ENABLE_RTTNEWS:
         print("\n[RTTNews] 开始抓取...", flush=True)
         try:
@@ -963,6 +993,7 @@ def run_monitor():
             for item in rttnews_items:
                 if is_cross_source_duplicate(item, collected_items):
                     cross_duplicates += 1
+                    rttnews_suppressed.append(item["dedup_key"])
                     print(f"[CROSS-DEDUP] 跳过重复事件: {item['ticker']} | {item['title_en']} | {item['event_time']}", flush=True)
                     continue
                 item["title"] = (translate_title(item["title_en"]) + " PDUFA").strip()
@@ -980,7 +1011,13 @@ def run_monitor():
         success = push_combined(collected_items, bpiq_keys, rttnews_keys)
         if success:
             append_lines(SENT_DB_FILE, new_urls)
+            # 推送成功后，把"被抑制"的 key 也记入去重库，防止下一轮被当作新条目再次推送
+            append_lines(BPIQ_SENT_DB_FILE, bpiq_suppressed)
+            append_lines(RTTNEWS_SENT_DB_FILE, rttnews_suppressed)
     else:
+        # 没有需要推送的内容，但被抑制的条目仍需记录
+        append_lines(BPIQ_SENT_DB_FILE, bpiq_suppressed)
+        append_lines(RTTNEWS_SENT_DB_FILE, rttnews_suppressed)
         print("未发现满足条件的新条目（RSS、BPIQ 与 RTTNews 均为空）", flush=True)
         print(f"RSS: new_urls={len(new_urls)}, tickers={rss_tickers}", flush=True)
         print(f"BPIQ keys: {len(bpiq_keys)}, RTTNews keys: {len(rttnews_keys)}", flush=True)
