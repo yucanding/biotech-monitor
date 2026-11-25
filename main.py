@@ -39,6 +39,7 @@ RSS_URLS = [
 SENT_DB_FILE = "sent_urls.txt"
 BPIQ_SENT_DB_FILE = "sent_bpiq.txt"
 RTTNEWS_SENT_DB_FILE = "sent_rttnews.txt"
+RTTNEWS_LINKS_DB_FILE = "sent_rttnews_links.txt"   # 专门记录已处理的 RTTNews 链接
 ENABLE_BPIQ = True
 ENABLE_RTTNEWS = True
 RTTNEWS_DAYS_BEFORE = 0
@@ -728,6 +729,13 @@ def make_rttnews_dedup_key(ticker: str, title_en: str, start_date: date, end_dat
     """
     return f"{ticker.upper().strip()}|{start_date.isoformat()}|{end_date.isoformat()}"
 
+def make_rttnews_link_key(link: str, start_date: date) -> str:
+    """
+    链接去重 key：详情页链接 | 事件开始日期。
+    带日期是为了避免同一药物详情页在"重新提交、新 PDUFA 日期"时被永久屏蔽。
+    """
+    return f"{link.strip()}|{start_date.isoformat()}"
+
 US_MARKET_HOLIDAYS = {
     date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16), date(2026, 4, 3),
     date(2026, 5, 25), date(2026, 6, 19), date(2026, 7, 3), date(2026, 9, 7),
@@ -784,6 +792,7 @@ def parse_rttnews_page(html: str, page_url: str, window_start: date, window_end:
             "ticker": ticker, "title_en": title_en,
             "event_time": format_rttnews_event_time(d, month_only),
             "link": link or page_url,
+            "_link_real": bool(link),   # False 表示回退成了列表页 URL，不能用作去重 key
             "_source": "RTTNews", "_date_start": date_start, "_date_end": date_end,
             "_match_text": title_en,
         })
@@ -796,6 +805,8 @@ def scrape_rttnews_catalysts() -> List[Dict]:
     print(f"[RTTNews] 时间窗口：{window_start} ~ {window_end}", flush=True)
     sent = read_set(RTTNEWS_SENT_DB_FILE)
     print(f"[RTTNews] 已读取去重记录 {len(sent)} 条", flush=True)
+    sent_links = read_set(RTTNEWS_LINKS_DB_FILE)
+    print(f"[RTTNews] 已读取链接记录 {len(sent_links)} 条", flush=True)
     items = []
     seen_keys = set()  # 本轮内部去重（多页重复出现同一事件）
     for url in RTTNEWS_URLS:
@@ -807,10 +818,14 @@ def scrape_rttnews_catalysts() -> List[Dict]:
             continue
         for row in parse_rttnews_page(resp.text, url, window_start, window_end, today):
             dedup_key = make_rttnews_dedup_key(row["ticker"], row["title_en"], row["_date_start"], row["_date_end"])
+            link_key = make_rttnews_link_key(row["link"], row["_date_start"]) if row.get("_link_real") else ""
             if dedup_key in sent or dedup_key in seen_keys:
+                continue
+            if link_key and link_key in sent_links:
                 continue
             seen_keys.add(dedup_key)
             row["dedup_key"] = dedup_key
+            row["link_key"] = link_key
             items.append(row)
     print(f"[RTTNews] 本轮新条目 {len(items)} 条（未翻译、未跨源去重）", flush=True)
     return items
@@ -985,6 +1000,7 @@ def run_monitor():
     # ---- 3. RTTNews ----
     rttnews_keys = []
     rttnews_suppressed = []
+    rttnews_link_keys = []   # 已推送 + 被抑制条目的链接 key，成功后写入链接文件
     if ENABLE_RTTNEWS:
         print("\n[RTTNews] 开始抓取...", flush=True)
         try:
@@ -994,11 +1010,15 @@ def run_monitor():
                 if is_cross_source_duplicate(item, collected_items):
                     cross_duplicates += 1
                     rttnews_suppressed.append(item["dedup_key"])
+                    if item.get("link_key"):
+                        rttnews_link_keys.append(item["link_key"])
                     print(f"[CROSS-DEDUP] 跳过重复事件: {item['ticker']} | {item['title_en']} | {item['event_time']}", flush=True)
                     continue
                 item["title"] = (translate_title(item["title_en"]) + " PDUFA").strip()
                 collected_items.append(item)
                 rttnews_keys.append(item["dedup_key"])
+                if item.get("link_key"):
+                    rttnews_link_keys.append(item["link_key"])
             print(f"[CROSS-DEDUP] RTTNews 跨源去重: {cross_duplicates} 条，保留 {len(rttnews_keys)} 条", flush=True)
         except Exception as e:
             print(f"[RTTNews] 失败: {e}", flush=True)
@@ -1014,10 +1034,12 @@ def run_monitor():
             # 推送成功后，把"被抑制"的 key 也记入去重库，防止下一轮被当作新条目再次推送
             append_lines(BPIQ_SENT_DB_FILE, bpiq_suppressed)
             append_lines(RTTNEWS_SENT_DB_FILE, rttnews_suppressed)
+            append_lines(RTTNEWS_LINKS_DB_FILE, rttnews_link_keys)
     else:
         # 没有需要推送的内容，但被抑制的条目仍需记录
         append_lines(BPIQ_SENT_DB_FILE, bpiq_suppressed)
         append_lines(RTTNEWS_SENT_DB_FILE, rttnews_suppressed)
+        append_lines(RTTNEWS_LINKS_DB_FILE, rttnews_link_keys)
         print("未发现满足条件的新条目（RSS、BPIQ 与 RTTNews 均为空）", flush=True)
         print(f"RSS: new_urls={len(new_urls)}, tickers={rss_tickers}", flush=True)
         print(f"BPIQ keys: {len(bpiq_keys)}, RTTNews keys: {len(rttnews_keys)}", flush=True)
